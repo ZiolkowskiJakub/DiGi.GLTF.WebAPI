@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<LangVersion>latest</LangVersion>
+		<OutputPath>..\bin\</OutputPath>
+		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+		<AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+		<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+		<Nullable>enable</Nullable>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<FrameworkReference Include="Microsoft.AspNetCore.App" />
+		<!-- NetTopologySuite is a NuGet dependency of DiGi.Geometry (referenced via HintPath), so it must be re-added here to reach the extension output. -->
+		<PackageReference Include="NetTopologySuite" Version="2.6.0" />
+		<PackageReference Include="SharpGLTF.Toolkit" Version="1.0.6" />
+		<PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<Reference Include="DiGi.Core">
+			<HintPath>..\..\DiGi.Core\bin\DiGi.Core.dll</HintPath>
+		</Reference>
+		<Reference Include="DiGi.Geometry">
+			<HintPath>..\..\DiGi.Geometry\bin\DiGi.Geometry.dll</HintPath>
+		</Reference>
+		<Reference Include="DiGi.GLTF">
+			<HintPath>..\..\DiGi.GLTF\bin\DiGi.GLTF.dll</HintPath>
+		</Reference>
+		<Reference Include="DiGi.Serilog">
+			<HintPath>..\..\DiGi.Serilog\bin\DiGi.Serilog.dll</HintPath>
+		</Reference>
+		<Reference Include="DiGi.WebAPI">
+			<HintPath>..\..\DiGi.WebAPI\bin\DiGi.WebAPI.dll</HintPath>
+		</Reference>
+	</ItemGroup>
+
+</Project>

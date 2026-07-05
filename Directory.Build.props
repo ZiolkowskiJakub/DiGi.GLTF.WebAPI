@@ -1,0 +1,22 @@
+<Project>
+  <PropertyGroup>
+    <Major>0</Major>
+    <Minor>8</Minor>
+	<Build>5</Build>
+
+    <!-- Assembly binding version (keep stable for compatibility) -->
+    <AssemblyVersion>$(Major).$(Minor).$(Build)</AssemblyVersion>
+
+    <!-- NuGet package version -->
+    <Version>$(Major).$(Minor).$(Build)</Version>
+
+    <!-- File version (changes every build) -->
+    <FileVersion>$(Major).$(Minor).$(Build)</FileVersion>
+
+    <!-- Build = yyyyMMdd.HHmm (UTC) -->
+	<Revision>$([System.DateTime]::UtcNow.ToString("yyyyMMddHHmmss"))</Revision>
+
+    <!-- Informational version (human-readable, can include git commit later) -->
+    <InformationalVersion>$(Major).$(Minor).$(Build).$(Revision)</InformationalVersion>
+  </PropertyGroup>
+</Project>
