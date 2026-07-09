@@ -1,4 +1,4 @@
-#### [DiGi\.GLTF\.WebAPI](index.md 'index')
+#### [DiGi\.GLTF\.WebAPI](DiGi.GLTF.WebAPI.Overview.md 'DiGi\.GLTF\.WebAPI\.Overview')
 
 ## DiGi\.GLTF\.WebAPI Assembly
 
