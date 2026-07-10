@@ -9,7 +9,7 @@ namespace DiGi.GLTF.WebAPI
         /// Initializes the GLTF Web API services required by its controllers.
         /// <para>This method is the extension initialization entry point invoked by the hosting service; the controllers currently require no additional services.</para>
         /// </summary>
-        /// <param name="serviceCollection">The <see cref="Microsoft.Extensions.DependencyInjection.IServiceCollection" /> to add services to.</param>
+        /// <param name="serviceCollection">The <see cref="IServiceCollection" /> to add services to.</param>
         /// <returns>A <see cref="Task"/> representing the asynchronous operation.</returns>
         public static async Task InitializeAsync(this IServiceCollection serviceCollection)
         {
