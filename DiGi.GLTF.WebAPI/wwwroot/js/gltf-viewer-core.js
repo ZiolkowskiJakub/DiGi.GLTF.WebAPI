@@ -17,8 +17,12 @@
 // - Events dispatched on the container element:
 //   'gltf-ready'            detail: { objectCount }
 //   'gltf-selectionchanged' detail: { references: string[] } (generic object identifiers)
-// - Public API: frameScene(), clearSelection(), getSunState(), setSun(azimuth, altitude),
-//   setSunIntensity(value), setAmbientIntensity(value), getUserData(reference).
+// - Public API: frameScene(), frameSelection(), clearSelection(), getSunState(),
+//   setSun(azimuth, altitude), setSunIntensity(value), setAmbientIntensity(value),
+//   getUserData(reference).
+// - Right-click context menu: built-in default behavior with "Fit view", "Fit selection"
+//   (enabled only while objects are selected) and "Clear selection". Consuming applications may
+//   extend the `contextMenuItems` array ({ label, action(), isEnabled() }) before the first open.
 // DiGi geometry is Z-up while three.js is Y-up: the loaded model is rotated -90deg
 // around X, and any DiGi vector (x, y, z) maps to three.js world (x, z, -y).
 
@@ -145,10 +149,20 @@ export class GltfViewer {
         this.lastHoverTime = 0;
         this.bvh = null;
 
+        // Default right-click context menu; consuming applications may extend this array before
+        // the first open. Item shape: { label, action(), isEnabled() } — isEnabled is evaluated
+        // each time the menu opens.
+        this.contextMenuItems = [
+            { label: 'Fit view', action: () => this.frameScene(), isEnabled: () => true },
+            { label: 'Fit selection', action: () => this.frameSelection(), isEnabled: () => this.selectedIds.size > 0 },
+            { label: 'Clear selection', action: () => this.clearSelection(), isEnabled: () => true }
+        ];
+
         this.initRenderer();
         this.initOverlays();
         this.initScene();
         this.initCameraAndControls();
+        this.initContextMenu();
         this.initPicking();
         this.loadGlb();
         this.animate();
@@ -188,7 +202,7 @@ export class GltfViewer {
             padding: '3px 10px', borderRadius: '4px', background: 'rgba(20, 24, 32, 0.75)',
             color: '#9aa3b2', fontSize: '0.75rem', whiteSpace: 'nowrap'
         });
-        this.controlsHint.textContent = 'Middle mouse: Pan · Shift + Middle mouse: Orbit · Wheel: Zoom · Left drag →: Window selection · Left drag ←: Crossing selection';
+        this.controlsHint.textContent = 'Middle mouse: Pan · Shift + Middle mouse: Orbit · Wheel: Zoom · Left drag →: Window selection · Left drag ←: Crossing selection · Right click: Menu';
         this.container.appendChild(this.controlsHint);
 
         this.marqueeStart = null;
@@ -229,13 +243,93 @@ export class GltfViewer {
             }
         });
 
-        // Prevent the browser autoscroll behavior on middle mouse drag and the context menu.
+        // Prevent the browser autoscroll behavior on middle mouse drag.
         this.renderer.domElement.addEventListener('mousedown', (event) => {
             if (event.button === 1) {
                 event.preventDefault();
             }
         });
-        this.renderer.domElement.addEventListener('contextmenu', (event) => event.preventDefault());
+    }
+
+    // Built-in right-click context menu. The right mouse button is free (OrbitControls maps it to
+    // null and picking only reacts to button 0), so the browser menu is replaced with the viewer
+    // menu built from `contextMenuItems`. Styling is inline like the other overlays, so the menu
+    // works in any host application without stylesheet support.
+    initContextMenu() {
+        this.contextMenu = document.createElement('div');
+        Object.assign(this.contextMenu.style, {
+            position: 'absolute', zIndex: '8', display: 'none', minWidth: '160px',
+            padding: '4px 0', borderRadius: '6px', background: 'rgba(20, 24, 32, 0.95)',
+            border: '1px solid rgba(255, 255, 255, 0.08)', boxShadow: '0 4px 16px rgba(0, 0, 0, 0.45)',
+            color: '#e6e9ef', fontSize: '0.85rem', whiteSpace: 'nowrap', userSelect: 'none'
+        });
+        this.contextMenu.addEventListener('contextmenu', (event) => event.preventDefault());
+        this.container.appendChild(this.contextMenu);
+
+        this.renderer.domElement.addEventListener('contextmenu', (event) => {
+            event.preventDefault();
+            this.openContextMenu(event);
+        });
+
+        // Any pointer press outside the menu closes it: left click, middle-mouse pan start, or a
+        // right click elsewhere (which then reopens the menu at the new position).
+        document.addEventListener('pointerdown', (event) => {
+            if (this.contextMenu.style.display !== 'none' && !this.contextMenu.contains(event.target)) {
+                this.closeContextMenu();
+            }
+        }, true);
+
+        window.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape' && this.contextMenu.style.display !== 'none') {
+                this.closeContextMenu();
+            }
+        });
+
+        // Wheel zoom is a camera interaction that bypasses pointerdown.
+        this.renderer.domElement.addEventListener('wheel', () => this.closeContextMenu());
+    }
+
+    openContextMenu(event) {
+        // Items are rebuilt on each open so the enabled state reflects the current selection.
+        this.contextMenu.innerHTML = '';
+        for (const item of this.contextMenuItems) {
+            const element = document.createElement('div');
+            element.textContent = item.label;
+            Object.assign(element.style, { padding: '6px 14px' });
+
+            if (item.isEnabled()) {
+                element.style.cursor = 'pointer';
+                element.addEventListener('pointerenter', () => {
+                    element.style.background = 'rgba(77, 144, 254, 0.18)';
+                });
+                element.addEventListener('pointerleave', () => {
+                    element.style.background = 'transparent';
+                });
+                element.addEventListener('click', () => {
+                    this.closeContextMenu();
+                    item.action();
+                });
+            } else {
+                element.style.color = '#5d6570';
+                element.style.cursor = 'default';
+            }
+
+            this.contextMenu.appendChild(element);
+        }
+
+        // Measure hidden, then clamp so the menu never overflows the container.
+        const position = this.containerPosition(event);
+        this.contextMenu.style.visibility = 'hidden';
+        this.contextMenu.style.display = 'block';
+        const left = Math.max(4, Math.min(position.x, this.container.clientWidth - this.contextMenu.offsetWidth - 4));
+        const top = Math.max(4, Math.min(position.y, this.container.clientHeight - this.contextMenu.offsetHeight - 4));
+        this.contextMenu.style.left = `${left}px`;
+        this.contextMenu.style.top = `${top}px`;
+        this.contextMenu.style.visibility = 'visible';
+    }
+
+    closeContextMenu() {
+        this.contextMenu.style.display = 'none';
     }
 
     aspect() {
@@ -533,17 +627,71 @@ export class GltfViewer {
             return;
         }
 
-        // Autoframing: place the camera so the whole bounding sphere fits the view.
-        const fovRad = THREE.MathUtils.degToRad(this.camera.fov);
-        const distance = (this.radius / Math.tan(fovRad / 2)) * 1.25;
-        const direction = new THREE.Vector3(1, 0.65, 1).normalize();
+        this.frameBounds(this.center, this.radius);
+    }
 
-        this.camera.position.copy(this.center.clone().add(direction.multiplyScalar(distance)));
+    // Places the camera so the bounding sphere (center, radius) fits the view with 1.25 padding.
+    // The optional direction keeps a caller-chosen viewing angle; the default is the canonical
+    // scene-framing direction.
+    frameBounds(center, radius, direction = new THREE.Vector3(1, 0.65, 1).normalize()) {
+        const fovRad = THREE.MathUtils.degToRad(this.camera.fov);
+        const distance = (radius / Math.tan(fovRad / 2)) * 1.25;
+
+        this.camera.position.copy(center.clone().add(direction.clone().multiplyScalar(distance)));
         this.camera.near = Math.max(0.01, distance / 1000);
         this.camera.far = distance * 100;
         this.camera.updateProjectionMatrix();
-        this.controls.target.copy(this.center);
+        this.controls.target.copy(center);
         this.controls.update();
+    }
+
+    // Fits the camera to the currently selected objects, preserving the current viewing angle so
+    // the view zooms/pans to the selection without swinging around it. No-op when nothing is
+    // selected or the selection has no geometry.
+    frameSelection() {
+        const box = this.selectionBounds();
+        if (!box) {
+            return;
+        }
+
+        const center = box.getCenter(new THREE.Vector3());
+        const radius = Math.max(0.5, box.getSize(new THREE.Vector3()).length() / 2);
+        const direction = this.camera.position.clone().sub(this.controls.target);
+        this.frameBounds(center, radius, direction.lengthSq() > 1e-6 ? direction.normalize() : undefined);
+    }
+
+    // Union world-space bounding box over the selected objects, or null when empty. Batched
+    // objects share one merged mesh, so their geometry is the contiguous vertex sub-range
+    // [vertexStart, vertexStart + vertexCount) — Box3.setFromObject would measure the whole batch.
+    selectionBounds() {
+        const box = new THREE.Box3();
+        const vertex = new THREE.Vector3();
+
+        for (const id of this.selectedIds) {
+            const object = this.objects[id];
+            const mesh = object?.mesh;
+            if (!mesh) {
+                continue;
+            }
+
+            if (this.batched) {
+                const position = mesh.geometry?.getAttribute('position');
+                if (!position || object.vertexCount === 0) {
+                    continue;
+                }
+                mesh.updateWorldMatrix(true, false);
+                const end = object.vertexStart + object.vertexCount;
+                for (let i = object.vertexStart; i < end; i++) {
+                    vertex.fromBufferAttribute(position, i);
+                    vertex.applyMatrix4(mesh.matrixWorld);
+                    box.expandByPoint(vertex);
+                }
+            } else {
+                box.union(new THREE.Box3().setFromObject(mesh));
+            }
+        }
+
+        return box.isEmpty() ? null : box;
     }
 
     clearSelection() {
