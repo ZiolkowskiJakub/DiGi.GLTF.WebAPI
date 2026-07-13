@@ -11,6 +11,8 @@
 // - Selection: left click selects a single object; left drag performs a directional marquee
 //   (left-to-right = window selection of fully enclosed objects with a solid rectangle,
 //   right-to-left = crossing selection of intersecting objects with a dashed rectangle).
+//   While dragging, the objects the marquee would select are live-highlighted with the
+//   selection tint; the preview updates on every pointer move for both directions.
 // - Raycasting is accelerated with three-mesh-bvh when the optional module resolves; without it,
 //   hover picking is throttled to keep the frame rate stable on large merged meshes.
 // Integration contract for consuming applications:
@@ -207,6 +209,8 @@ export class GltfViewer {
 
         this.marqueeStart = null;
         this.marqueeCurrent = null;
+        this.marqueePreviewIds = new Set();
+        this.marqueeBounds = null;
     }
 
     initScene() {
@@ -726,6 +730,7 @@ export class GltfViewer {
             }
             this.marqueeStart = this.containerPosition(event);
             this.marqueeCurrent = null;
+            this.marqueeBounds = null;
             // Keep receiving pointer events when the drag leaves the canvas; capture can be
             // unavailable for some pointer types, in which case the drag still works within the canvas.
             try {
@@ -753,13 +758,24 @@ export class GltfViewer {
 
             if (Math.hypot(end.x - start.x, end.y - start.y) <= MARQUEE_THRESHOLD) {
                 // Plain click: single selection via raycasting.
+                this.updateMarqueePreview([]);
+                this.marqueeBounds = null;
                 this.updatePointer(event);
                 const id = this.pick();
                 this.select(id === null ? [] : [id]);
                 return;
             }
 
-            this.select(this.marqueeSelect(start, end));
+            const ids = this.marqueeSelect(start, end);
+            this.updateMarqueePreview([]);
+            this.marqueeBounds = null;
+            this.select(ids);
+        });
+
+        // Zooming with the wheel mid-drag moves the camera, which invalidates the screen-space
+        // bounds cached for the active marquee.
+        this.controls.addEventListener('change', () => {
+            this.marqueeBounds = null;
         });
     }
 
@@ -775,6 +791,7 @@ export class GltfViewer {
         const current = this.marqueeCurrent;
 
         if (Math.hypot(current.x - start.x, current.y - start.y) <= MARQUEE_THRESHOLD) {
+            this.updateMarqueePreview([]);
             return;
         }
 
@@ -788,6 +805,30 @@ export class GltfViewer {
         this.marquee.style.top = `${Math.min(start.y, current.y)}px`;
         this.marquee.style.width = `${Math.abs(current.x - start.x)}px`;
         this.marquee.style.height = `${Math.abs(current.y - start.y)}px`;
+
+        // Live preview: highlight the objects the marquee would select on release.
+        this.updateMarqueePreview(this.marqueeSelect(start, current));
+    }
+
+    // Retints the objects the active marquee would select so the selection is visible while
+    // dragging. Only the difference against the previous preview is retinted, keeping pointer
+    // moves cheap. Passing an empty list clears the preview.
+    updateMarqueePreview(ids) {
+        const previewIds = new Set(ids);
+
+        for (const id of this.marqueePreviewIds) {
+            if (!previewIds.has(id)) {
+                this.applyHighlight(id);
+            }
+        }
+
+        for (const id of previewIds) {
+            if (!this.marqueePreviewIds.has(id)) {
+                this.applyHighlight(id, SELECTED_TINT);
+            }
+        }
+
+        this.marqueePreviewIds = previewIds;
     }
 
     hideMarquee() {
@@ -798,7 +839,13 @@ export class GltfViewer {
     // contiguous vertex range (batched) or its whole geometry (legacy) to screen space.
     // - Window (left-to-right): only objects completely inside the rectangle.
     // - Crossing (right-to-left): objects whose screen-space bounding box intersects the rectangle.
+    // The projected bounds only depend on the camera, which cannot orbit during a left drag, so
+    // they are computed once per drag and reused for every live preview rectangle test.
     marqueeSelect(start, end) {
+        if (!this.marqueeBounds) {
+            this.marqueeBounds = this.computeScreenBounds();
+        }
+
         const crossing = end.x < start.x;
 
         const minX = Math.min(start.x, end.x);
@@ -806,13 +853,37 @@ export class GltfViewer {
         const minY = Math.min(start.y, end.y);
         const maxY = Math.max(start.y, end.y);
 
+        const selected = [];
+        for (let id = 0; id < this.marqueeBounds.length; id++) {
+            const bounds = this.marqueeBounds[id];
+            if (!bounds) {
+                continue;
+            }
+
+            if (crossing) {
+                if (bounds.minX <= maxX && bounds.maxX >= minX && bounds.minY <= maxY && bounds.maxY >= minY) {
+                    selected.push(id);
+                }
+            } else {
+                if (bounds.allInFront && bounds.minX >= minX && bounds.maxX <= maxX && bounds.minY >= minY && bounds.maxY <= maxY) {
+                    selected.push(id);
+                }
+            }
+        }
+
+        return selected;
+    }
+
+    // Projects every object's vertex range to screen space and returns its 2D bounding box, or
+    // null for objects without projectable geometry (missing positions, fully behind the camera).
+    computeScreenBounds() {
         const width = this.container.clientWidth;
         const height = this.container.clientHeight;
         const vertex = new THREE.Vector3();
         const viewMatrix = this.camera.matrixWorldInverse;
         const projectionMatrix = this.camera.projectionMatrix;
 
-        const selected = [];
+        const screenBounds = new Array(this.objects.length).fill(null);
         for (let id = 0; id < this.objects.length; id++) {
             const object = this.objects[id];
             const mesh = object.mesh;
@@ -859,18 +930,10 @@ export class GltfViewer {
                 continue;
             }
 
-            if (crossing) {
-                if (pMinX <= maxX && pMaxX >= minX && pMinY <= maxY && pMaxY >= minY) {
-                    selected.push(id);
-                }
-            } else {
-                if (allInFront && pMinX >= minX && pMaxX <= maxX && pMinY >= minY && pMaxY <= maxY) {
-                    selected.push(id);
-                }
-            }
+            screenBounds[id] = { minX: pMinX, minY: pMinY, maxX: pMaxX, maxY: pMaxY, allInFront };
         }
 
-        return selected;
+        return screenBounds;
     }
 
     updatePointer(event) {
