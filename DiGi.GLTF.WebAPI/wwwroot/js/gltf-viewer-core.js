@@ -185,9 +185,9 @@ export class GltfViewer {
     initOverlays() {
         this.hoverLabel = document.createElement('div');
         Object.assign(this.hoverLabel.style, {
-            position: 'absolute', pointerEvents: 'none', zIndex: '6', padding: '2px 8px',
-            borderRadius: '4px', background: 'rgba(20, 24, 32, 0.85)', color: '#e6e9ef',
-            fontSize: '0.8rem', display: 'none', whiteSpace: 'nowrap'
+            position: 'absolute', left: '10px', bottom: '10px', pointerEvents: 'none', zIndex: '6',
+            padding: '3px 10px', borderRadius: '4px', background: 'rgba(20, 24, 32, 0.75)',
+            color: '#e6e9ef', fontSize: '0.75rem', display: 'none', whiteSpace: 'nowrap'
         });
         this.container.appendChild(this.hoverLabel);
 
@@ -197,15 +197,6 @@ export class GltfViewer {
             border: '1px solid #4d90fe', background: 'rgba(77, 144, 254, 0.12)'
         });
         this.container.appendChild(this.marquee);
-
-        this.controlsHint = document.createElement('div');
-        Object.assign(this.controlsHint.style, {
-            position: 'absolute', left: '10px', bottom: '10px', zIndex: '5', pointerEvents: 'none',
-            padding: '3px 10px', borderRadius: '4px', background: 'rgba(20, 24, 32, 0.75)',
-            color: '#9aa3b2', fontSize: '0.75rem', whiteSpace: 'nowrap'
-        });
-        this.controlsHint.textContent = 'Middle mouse: Pan · Shift + Middle mouse: Orbit · Wheel: Zoom · Left drag →: Window selection · Left drag ←: Crossing selection · Right click: Menu';
-        this.container.appendChild(this.controlsHint);
 
         this.marqueeStart = null;
         this.marqueeCurrent = null;
@@ -989,10 +980,7 @@ export class GltfViewer {
         if (id !== null) {
             this.applyHighlight(id, this.selectedIds.has(id) ? SELECTED_TINT : HOVER_TINT);
             this.renderer.domElement.style.cursor = 'pointer';
-            const rect = this.container.getBoundingClientRect();
             this.hoverLabel.style.display = 'block';
-            this.hoverLabel.style.left = `${event.clientX - rect.left + 12}px`;
-            this.hoverLabel.style.top = `${event.clientY - rect.top + 12}px`;
             this.hoverLabel.textContent = this.objects[id].reference || this.objects[id].name || 'Object';
         } else {
             this.renderer.domElement.style.cursor = 'default';
