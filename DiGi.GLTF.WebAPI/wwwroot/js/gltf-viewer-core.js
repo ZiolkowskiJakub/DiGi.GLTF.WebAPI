@@ -15,13 +15,16 @@
 //   selection tint; the preview updates on every pointer move for both directions.
 // - Raycasting is accelerated with three-mesh-bvh when the optional module resolves; without it,
 //   hover picking is throttled to keep the frame rate stable on large merged meshes.
+// - ViewCube: a Revit-style navigation gizmo in the bottom-right corner. Its orientation mirrors
+//   the main camera in real time; hovering highlights the face/edge/corner regions and clicking
+//   one smoothly aligns the camera to that direction around the current orbit target.
 // Integration contract for consuming applications:
 // - Events dispatched on the container element:
 //   'gltf-ready'            detail: { objectCount }
 //   'gltf-selectionchanged' detail: { references: string[] } (generic object identifiers)
 // - Public API: frameScene(), frameSelection(), clearSelection(), getSunState(),
 //   setSun(azimuth, altitude), setSunIntensity(value), setAmbientIntensity(value),
-//   getUserData(reference).
+//   getUserData(reference), alignViewToDirection(direction).
 // - Right-click context menu: built-in default behavior with "Fit view", "Fit selection"
 //   (enabled only while objects are selected) and "Clear selection". Consuming applications may
 //   extend the `contextMenuItems` array ({ label, action(), isEnabled() }) before the first open.
@@ -47,6 +50,14 @@ const EDGES_TRIANGLE_LIMIT = 400000;
 
 // Hover raycasts are throttled to this interval when BVH acceleration is unavailable.
 const HOVER_THROTTLE_MS = 40;
+
+// ViewCube gizmo: canvas size and viewport margin in CSS pixels, click-to-align tween duration,
+// and the hover highlight (the marquee/selection accent so the whole viewer chrome matches).
+const VIEW_CUBE_SIZE = 112;
+const VIEW_CUBE_MARGIN = 12;
+const VIEW_CUBE_ALIGN_MS = 600;
+const VIEW_CUBE_HIGHLIGHT = 0x4d90fe;
+const VIEW_CUBE_HOVER_OPACITY = 0.4;
 
 export function readSceneData(elementId) {
     const element = document.getElementById(elementId);
@@ -166,6 +177,7 @@ export class GltfViewer {
         this.initCameraAndControls();
         this.initContextMenu();
         this.initPicking();
+        this.initViewCube();
         this.loadGlb();
         this.animate();
     }
@@ -1054,10 +1066,245 @@ export class GltfViewer {
         this.container.dispatchEvent(new CustomEvent('gltf-selectionchanged', { detail: { references } }));
     }
 
+    // ------------------------------------------------------------------------------------------
+    // ViewCube: a Revit-style navigation gizmo in the bottom-right corner of the viewport.
+    // The cube stays axis-aligned in its own miniature scene while the gizmo camera mirrors the
+    // main camera orientation each frame, so the cube visually orbits with the scene and every
+    // pick zone's outward direction is directly the world-space direction to align the camera to.
+    // Rendered through its own small transparent renderer instead of a scissor pass on the main
+    // canvas: the gizmo canvas captures its own pointer events, so a left press on the cube can
+    // never start a marquee selection on the main canvas underneath.
+    // ------------------------------------------------------------------------------------------
+    initViewCube() {
+        this.viewCubeAnimation = null;
+        this.viewCubeHovered = null;
+        this.viewCubePointerDown = null;
+
+        this.viewCubeRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        this.viewCubeRenderer.setPixelRatio(window.devicePixelRatio);
+        this.viewCubeRenderer.setSize(VIEW_CUBE_SIZE, VIEW_CUBE_SIZE);
+        Object.assign(this.viewCubeRenderer.domElement.style, {
+            position: 'absolute', right: `${VIEW_CUBE_MARGIN}px`, bottom: `${VIEW_CUBE_MARGIN}px`,
+            zIndex: '6', cursor: 'default', touchAction: 'none'
+        });
+        this.container.appendChild(this.viewCubeRenderer.domElement);
+
+        this.viewCubeScene = new THREE.Scene();
+        this.viewCubeCamera = new THREE.PerspectiveCamera(45, 1, 0.1, 20);
+
+        // Hemisphere + directional lighting gives the Lambert faces enough shading contrast to
+        // read the cube's 3D orientation without washing out the labels.
+        this.viewCubeScene.add(new THREE.HemisphereLight(0xffffff, 0xb9c0c8, 1.1));
+        const light = new THREE.DirectionalLight(0xffffff, 0.5);
+        light.position.set(2, 3, 4);
+        this.viewCubeScene.add(light);
+
+        // Labeled unit cube. BoxGeometry material order: +X, -X, +Y, -Y, +Z, -Z. DiGi scenes are
+        // Z-up rotated to Y-up, so three.js +Y is the DiGi up axis: TOP/BOTTOM sit on +-Y.
+        const labels = ['RIGHT', 'LEFT', 'TOP', 'BOTTOM', 'FRONT', 'BACK'];
+        this.viewCubeScene.add(new THREE.Mesh(
+            new THREE.BoxGeometry(1, 1, 1),
+            labels.map((label) => new THREE.MeshLambertMaterial({ map: this.viewCubeFaceTexture(label) }))));
+
+        this.viewCubeScene.add(new THREE.LineSegments(
+            new THREE.EdgesGeometry(new THREE.BoxGeometry(1.002, 1.002, 1.002)),
+            new THREE.LineBasicMaterial({ color: 0x7a8494, transparent: true, opacity: 0.85 })));
+
+        this.viewCubeZones = this.createViewCubeZones();
+        this.viewCubeRaycaster = new THREE.Raycaster();
+
+        const dom = this.viewCubeRenderer.domElement;
+
+        dom.addEventListener('pointermove', (event) => {
+            const zone = this.pickViewCubeZone(event);
+            this.setViewCubeHovered(zone);
+            dom.style.cursor = zone ? 'pointer' : 'default';
+        });
+
+        dom.addEventListener('pointerleave', () => {
+            this.setViewCubeHovered(null);
+            dom.style.cursor = 'default';
+        });
+
+        dom.addEventListener('pointerdown', (event) => {
+            if (event.button === 0) {
+                this.viewCubePointerDown = { x: event.clientX, y: event.clientY };
+            }
+        });
+
+        dom.addEventListener('click', (event) => {
+            // Ignore clicks that ended a drag gesture on the gizmo.
+            const down = this.viewCubePointerDown;
+            this.viewCubePointerDown = null;
+            if (down && Math.hypot(event.clientX - down.x, event.clientY - down.y) > 4) {
+                return;
+            }
+
+            const zone = this.pickViewCubeZone(event);
+            if (zone) {
+                this.alignViewToDirection(zone.userData.viewCubeDirection);
+            }
+        });
+
+        dom.addEventListener('contextmenu', (event) => event.preventDefault());
+
+        // A user interaction with the main view takes over the camera immediately.
+        this.controls.addEventListener('start', () => {
+            this.viewCubeAnimation = null;
+        });
+    }
+
+    // Flat light face plate with a centered label and a subtle inset border.
+    viewCubeFaceTexture(label) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 128;
+        canvas.height = 128;
+
+        const context = canvas.getContext('2d');
+        context.fillStyle = '#f2f5f8';
+        context.fillRect(0, 0, 128, 128);
+        context.strokeStyle = '#c4cdd8';
+        context.lineWidth = 2;
+        context.strokeRect(1, 1, 126, 126);
+        context.fillStyle = '#3d4653';
+        context.font = '600 21px "Segoe UI", system-ui, sans-serif';
+        context.textAlign = 'center';
+        context.textBaseline = 'middle';
+        context.fillText(label, 64, 64);
+
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.colorSpace = THREE.SRGBColorSpace;
+        return texture;
+    }
+
+    // 26 pick zones tile the cube surface like Revit: 6 face centers, 12 edge bands, 8 corner
+    // cubelets. Each zone doubles as its own hover highlight (opacity 0 until hovered) and
+    // carries the world direction the camera moves to when clicked. Zones straddle the surface
+    // (half inside, half outside), so an edge/corner highlight wraps both adjacent faces while
+    // the inner half stays hidden by the opaque cube.
+    createViewCubeZones() {
+        const zones = [];
+        const faceSize = 0.7;                    // central face region of the unit cube
+        const bandSize = (1 - faceSize) / 2;     // edge/corner band width
+
+        for (let x = -1; x <= 1; x++) {
+            for (let y = -1; y <= 1; y++) {
+                for (let z = -1; z <= 1; z++) {
+                    if (x === 0 && y === 0 && z === 0) {
+                        continue;
+                    }
+
+                    const signs = [x, y, z];
+                    const zone = new THREE.Mesh(
+                        new THREE.BoxGeometry(
+                            ...signs.map((sign) => (sign === 0 ? faceSize : bandSize * 2))),
+                        new THREE.MeshBasicMaterial({
+                            color: VIEW_CUBE_HIGHLIGHT, transparent: true, opacity: 0, depthWrite: false
+                        }));
+                    zone.position.set(x * 0.5, y * 0.5, z * 0.5);
+                    zone.userData.viewCubeDirection = new THREE.Vector3(x, y, z).normalize();
+
+                    this.viewCubeScene.add(zone);
+                    zones.push(zone);
+                }
+            }
+        }
+
+        return zones;
+    }
+
+    pickViewCubeZone(event) {
+        const rect = this.viewCubeRenderer.domElement.getBoundingClientRect();
+        const pointer = new THREE.Vector2(
+            ((event.clientX - rect.left) / rect.width) * 2 - 1,
+            -((event.clientY - rect.top) / rect.height) * 2 + 1);
+
+        this.viewCubeRaycaster.setFromCamera(pointer, this.viewCubeCamera);
+        const intersections = this.viewCubeRaycaster.intersectObjects(this.viewCubeZones, false);
+        return intersections.length > 0 ? intersections[0].object : null;
+    }
+
+    setViewCubeHovered(zone) {
+        if (this.viewCubeHovered === zone) {
+            return;
+        }
+        if (this.viewCubeHovered) {
+            this.viewCubeHovered.material.opacity = 0;
+        }
+        this.viewCubeHovered = zone;
+        if (zone) {
+            zone.material.opacity = VIEW_CUBE_HOVER_OPACITY;
+        }
+    }
+
+    // Smoothly rotates the camera around the current orbit target until the view axis matches
+    // the given world direction (camera placed on the +direction side, looking back at the
+    // target). Distance and target are preserved; the sweep is a quaternion slerp so the camera
+    // travels the great-circle arc instead of cutting through the scene.
+    alignViewToDirection(direction) {
+        const offset = this.camera.position.clone().sub(this.controls.target);
+        const distance = Math.max(offset.length(), 1e-6);
+        const from = offset.lengthSq() > 1e-12 ? offset.normalize() : new THREE.Vector3(0, 0, 1);
+        const to = direction.clone().normalize();
+
+        // A perfect top/bottom view is parallel to the camera up axis, which degenerates the
+        // OrbitControls azimuth. Nudge toward the current horizontal heading (visually still a
+        // perfect plan view), so the arrival keeps the heading and the view stays orbitable.
+        if (Math.abs(to.y) > 0.9999) {
+            const horizontal = new THREE.Vector3(from.x, 0, from.z);
+            const hint = horizontal.lengthSq() > 1e-8 ? horizontal.normalize() : new THREE.Vector3(0, 0, 1);
+            to.addScaledVector(hint, 0.001).normalize();
+        }
+
+        this.viewCubeAnimation = {
+            from,
+            distance,
+            rotation: new THREE.Quaternion().setFromUnitVectors(from, to),
+            start: performance.now()
+        };
+    }
+
+    // Advances a pending click-to-align tween by moving the main camera along the great-circle
+    // arc. Runs before controls.update() so OrbitControls sees the tweened position as the
+    // authoritative camera state for the frame.
+    updateViewCubeAnimation() {
+        const animation = this.viewCubeAnimation;
+        if (!animation) {
+            return;
+        }
+
+        const t = Math.min(1, (performance.now() - animation.start) / VIEW_CUBE_ALIGN_MS);
+        const eased = t * t * (3 - 2 * t); // smoothstep ease-in-out
+        const rotation = new THREE.Quaternion().slerpQuaternions(new THREE.Quaternion(), animation.rotation, eased);
+        const direction = animation.from.clone().applyQuaternion(rotation);
+        this.camera.position.copy(this.controls.target).addScaledVector(direction, animation.distance);
+
+        if (t >= 1) {
+            this.viewCubeAnimation = null;
+        }
+    }
+
+    // Mirrors the final main camera orientation of the frame onto the gizmo camera (the cube
+    // itself stays axis aligned) and renders the gizmo scene. Runs after the main render so the
+    // gizmo never lags the damped camera by a frame.
+    updateViewCube() {
+        const direction = this.camera.position.clone().sub(this.controls.target);
+        if (direction.lengthSq() < 1e-12) {
+            direction.set(0, 0, 1);
+        }
+        this.viewCubeCamera.position.copy(direction.normalize().multiplyScalar(2.4));
+        this.viewCubeCamera.up.copy(this.camera.up);
+        this.viewCubeCamera.lookAt(0, 0, 0);
+
+        this.viewCubeRenderer.render(this.viewCubeScene, this.viewCubeCamera);
+    }
+
     animate() {
         this.renderer.setAnimationLoop(() => {
+            this.updateViewCubeAnimation();
             this.controls.update();
             this.renderer.render(this.scene, this.camera);
+            this.updateViewCube();
         });
     }
 }
