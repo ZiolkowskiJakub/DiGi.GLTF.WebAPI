@@ -27,10 +27,17 @@
 //   payloads toggle mesh visibility). The controls mount into a host-provided '#gltf-settings'
 //   element when the page has one (the host owns the surrounding card/title/theming); otherwise
 //   the engine creates its own collapsible panel docked to the left edge titled "Settings".
+// - Status terminal: a read-only task log docked to the bottom edge of the container, attached
+//   by default for every view. One line (the most recent task) is visible; a snapping splitter
+//   above the text area reveals earlier entries one full line per step, and a vertical scrollbar
+//   appears once the area is expanded beyond three lines. Any code reports the current task via
+//   the exported reportStatus(message) (or the 'gltf-status' document event); the boolean flag
+//   data-status-terminal="false" on the container removes the text area and splitter entirely.
 // Integration contract for consuming applications:
 // - Events dispatched on the container element:
 //   'gltf-ready'            detail: { objectCount }
 //   'gltf-selectionchanged' detail: { references: string[] } (generic object identifiers)
+//   'gltf-terminalresize'   detail: { height } (status terminal height in CSS pixels; 0 = hidden)
 // - Public API: frameScene(), frameSelection(), clearSelection(), getSunState(),
 //   setSun(azimuth, altitude), setSunIntensity(value), setAmbientIntensity(value),
 //   getUserData(reference), alignViewToDirection(direction), getEnvironmentState(),
@@ -92,6 +99,15 @@ const FOG_DEFAULT = 0.1;
 // Debounce for rebuilding the raycast BVH and edge overlays after a view-range change; the
 // index rebuild itself is cheap and runs live while the slider moves.
 const CULL_REBUILD_DELAY_MS = 300;
+
+// Status terminal: height of one log line and of the splitter bar in CSS pixels, the visible
+// line count above which the vertical scrollbar appears, the share of the container height the
+// terminal may grow to, and the number of retained log entries.
+const STATUS_LINE_HEIGHT = 20;
+const STATUS_SPLITTER_HEIGHT = 6;
+const STATUS_SCROLLBAR_LINES = 3;
+const STATUS_MAX_HEIGHT_RATIO = 0.5;
+const STATUS_HISTORY_LIMIT = 200;
 
 export function readSceneData(elementId) {
     const element = document.getElementById(elementId);
@@ -174,6 +190,216 @@ function objectIdAttributeOf(geometry) {
     return geometry.getAttribute('_objectid') ?? geometry.getAttribute('_OBJECTID') ?? null;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Status terminal: a generic, read-only task log docked to the bottom edge of the viewer
+// container. Any code anywhere in the application reports the current or completed task through
+// reportStatus(message) - or, without importing this module, by dispatching the 'gltf-status'
+// CustomEvent on document - and every attached terminal appends the message as a new line,
+// always keeping the most recent one in view. Messages reported before a terminal exists are
+// buffered and replayed on attach, so early tasks (e.g. "Loading...") are never lost.
+// ---------------------------------------------------------------------------------------------
+
+const statusHistory = [];
+
+export function reportStatus(message) {
+    if (message === undefined || message === null || message === '') {
+        return;
+    }
+
+    const entry = { time: new Date(), text: String(message) };
+    statusHistory.push(entry);
+    if (statusHistory.length > STATUS_HISTORY_LIMIT) {
+        statusHistory.shift();
+    }
+
+    document.dispatchEvent(new CustomEvent('gltf-status', { detail: { message: entry.text, time: entry.time } }));
+}
+
+export class GltfStatusTerminal {
+    // One terminal per container: repeated attach calls return the existing instance. The boolean
+    // visibility flag disables the feature entirely - data-status-terminal="false" on the
+    // container (or attach(container, { enabled: false })) yields no text area and no splitter.
+    static attach(container, options = {}) {
+        if (!container) {
+            return null;
+        }
+        if (container.gltfStatusTerminal !== undefined) {
+            return container.gltfStatusTerminal;
+        }
+
+        const enabled = options.enabled ?? (container.dataset.statusTerminal !== 'false');
+        container.gltfStatusTerminal = enabled ? new GltfStatusTerminal(container) : null;
+        return container.gltfStatusTerminal;
+    }
+
+    constructor(container) {
+        this.container = container;
+        this.visibleLines = 1;
+        this.hidden = false;
+
+        this.wrapper = document.createElement('div');
+        Object.assign(this.wrapper.style, {
+            position: 'absolute', left: '0', right: '0', bottom: '0', zIndex: '9',
+            display: 'flex', flexDirection: 'column'
+        });
+
+        // The splitter reveals earlier entries in whole-line steps (see the pointerdown handler).
+        this.splitter = document.createElement('div');
+        this.splitter.title = 'Drag up to show earlier entries; double-click to reset';
+        Object.assign(this.splitter.style, {
+            height: `${STATUS_SPLITTER_HEIGHT}px`, flex: '0 0 auto', cursor: 'row-resize',
+            touchAction: 'none', background: 'rgba(255, 255, 255, 0.08)'
+        });
+        this.splitter.addEventListener('pointerenter', () => {
+            this.splitter.style.background = 'rgba(77, 144, 254, 0.45)';
+        });
+        this.splitter.addEventListener('pointerleave', () => {
+            if (!this.dragging) {
+                this.splitter.style.background = 'rgba(255, 255, 255, 0.08)';
+            }
+        });
+        this.wrapper.appendChild(this.splitter);
+
+        this.textArea = document.createElement('div');
+        this.textArea.setAttribute('role', 'log');
+        this.textArea.setAttribute('aria-live', 'polite');
+        Object.assign(this.textArea.style, {
+            height: `${STATUS_LINE_HEIGHT}px`, overflowY: 'hidden', overflowX: 'hidden',
+            padding: '2px 10px', background: 'rgba(20, 24, 32, 0.85)', color: '#e6e9ef',
+            fontFamily: 'Consolas, "Cascadia Mono", "Courier New", monospace', fontSize: '0.75rem',
+            lineHeight: `${STATUS_LINE_HEIGHT}px`, userSelect: 'text', cursor: 'default',
+            scrollbarWidth: 'thin', scrollbarColor: 'rgba(255, 255, 255, 0.25) transparent'
+        });
+        this.wrapper.appendChild(this.textArea);
+
+        this.container.appendChild(this.wrapper);
+
+        this.initSplitterDrag();
+
+        this.statusListener = (event) => this.appendLine({
+            time: event.detail?.time ?? new Date(),
+            text: event.detail?.message ?? ''
+        });
+        document.addEventListener('gltf-status', this.statusListener);
+
+        for (const entry of statusHistory) {
+            this.appendLine(entry);
+        }
+
+        this.dispatchResize();
+    }
+
+    initSplitterDrag() {
+        this.dragging = false;
+
+        this.splitter.addEventListener('pointerdown', (event) => {
+            event.preventDefault();
+            try {
+                this.splitter.setPointerCapture(event.pointerId);
+            } catch {
+                // Capture keeps the drag alive outside the window but is not required: the move
+                // and up listeners live on document, so the drag works either way.
+            }
+            this.dragging = true;
+
+            const startY = event.clientY;
+            const startLines = this.visibleLines;
+
+            const onPointerMove = (moveEvent) => {
+                // Stepped resize: the height snaps to whole text lines instead of following the
+                // pointer continuously - one full line is revealed or hidden per step.
+                this.setVisibleLines(startLines + Math.round((startY - moveEvent.clientY) / STATUS_LINE_HEIGHT));
+            };
+
+            const onPointerUp = () => {
+                this.dragging = false;
+                this.splitter.style.background = 'rgba(255, 255, 255, 0.08)';
+                document.removeEventListener('pointermove', onPointerMove);
+                document.removeEventListener('pointerup', onPointerUp);
+            };
+
+            document.addEventListener('pointermove', onPointerMove);
+            document.addEventListener('pointerup', onPointerUp);
+        });
+
+        this.splitter.addEventListener('dblclick', () => this.setVisibleLines(1));
+    }
+
+    // Appends one log line and keeps the most recent entry in view.
+    appendLine(entry) {
+        if (!entry.text) {
+            return;
+        }
+
+        const line = document.createElement('div');
+        line.title = entry.text;
+        Object.assign(line.style, {
+            height: `${STATUS_LINE_HEIGHT}px`, whiteSpace: 'nowrap',
+            overflow: 'hidden', textOverflow: 'ellipsis'
+        });
+
+        const time = document.createElement('span');
+        time.textContent = `${entry.time.toTimeString().slice(0, 8)}  `;
+        time.style.color = '#5d6570';
+        line.appendChild(time);
+
+        const text = document.createElement('span');
+        text.textContent = entry.text;
+        line.appendChild(text);
+
+        this.textArea.appendChild(line);
+        while (this.textArea.childElementCount > STATUS_HISTORY_LIMIT) {
+            this.textArea.removeChild(this.textArea.firstElementChild);
+        }
+
+        this.textArea.scrollTop = this.textArea.scrollHeight;
+    }
+
+    // Reports a task status to this terminal only; reportStatus() broadcasts to all terminals.
+    log(message) {
+        if (message !== undefined && message !== null && message !== '') {
+            this.appendLine({ time: new Date(), text: String(message) });
+        }
+    }
+
+    setVisibleLines(value) {
+        const maximum = Math.max(1, Math.floor((this.container.clientHeight * STATUS_MAX_HEIGHT_RATIO) / STATUS_LINE_HEIGHT));
+        const lines = Math.max(1, Math.min(maximum, Math.round(value)));
+        if (lines === this.visibleLines) {
+            return;
+        }
+
+        this.visibleLines = lines;
+        this.textArea.style.height = `${lines * STATUS_LINE_HEIGHT}px`;
+        // The scrollbar appears on the right side once the area shows more than three lines;
+        // below that the area stays pinned to the latest entry.
+        this.textArea.style.overflowY = lines > STATUS_SCROLLBAR_LINES ? 'auto' : 'hidden';
+        this.textArea.scrollTop = this.textArea.scrollHeight;
+        this.dispatchResize();
+    }
+
+    // Runtime counterpart of the data-status-terminal flag: hides or shows the whole overlay.
+    setVisible(visible) {
+        this.hidden = !visible;
+        this.wrapper.style.display = visible ? 'flex' : 'none';
+        this.dispatchResize();
+    }
+
+    // Lets the viewer (and any other bottom-docked overlay owner) stay above the terminal.
+    dispatchResize() {
+        const height = this.hidden ? 0 : this.wrapper.getBoundingClientRect().height;
+        this.container.dispatchEvent(new CustomEvent('gltf-terminalresize', { detail: { height } }));
+    }
+
+    dispose() {
+        document.removeEventListener('gltf-status', this.statusListener);
+        this.wrapper.remove();
+        this.hidden = true;
+        this.dispatchResize();
+        delete this.container.gltfStatusTerminal;
+    }
+}
+
 export class GltfViewer {
     constructor(container, sceneData, glbBuffer) {
         this.container = container;
@@ -223,8 +449,24 @@ export class GltfViewer {
         this.initPicking();
         this.initViewCube();
         this.initSettingsPanel();
+        this.initStatusTerminal();
         this.loadGlb();
         this.animate();
+    }
+
+    // Status terminal attached by default for every view; a host page opts out with
+    // data-status-terminal="false" on the container, or reuses an instance it attached earlier
+    // (e.g. to report statuses while the payload is still being fetched).
+    initStatusTerminal() {
+        this.container.addEventListener('gltf-terminalresize', (event) => {
+            // Keep the other bottom-docked overlays above the terminal.
+            const offset = Math.max(0, event.detail?.height ?? 0);
+            this.hoverLabel.style.bottom = `${offset + 10}px`;
+            this.viewCubeRenderer.domElement.style.bottom = `${offset + VIEW_CUBE_MARGIN}px`;
+        });
+
+        this.statusTerminal = GltfStatusTerminal.attach(this.container);
+        this.statusTerminal?.dispatchResize();
     }
 
     initRenderer() {
