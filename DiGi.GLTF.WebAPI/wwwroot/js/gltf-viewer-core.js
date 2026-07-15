@@ -947,7 +947,7 @@ export class GltfViewer {
     // scene-framing direction.
     frameBounds(center, radius, direction = new THREE.Vector3(1, 0.65, 1).normalize()) {
         const fovRad = THREE.MathUtils.degToRad(this.camera.fov);
-        const distance = (radius / Math.tan(fovRad / 2)) * 1.25;
+        const distance = (radius / Math.tan(fovRad / 2)) * 0.75;
 
         this.camera.position.copy(center.clone().add(direction.clone().multiplyScalar(distance)));
         this.camera.near = Math.max(0.01, distance / 1000);
