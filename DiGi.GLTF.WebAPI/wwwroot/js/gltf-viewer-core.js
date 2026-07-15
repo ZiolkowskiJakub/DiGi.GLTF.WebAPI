@@ -1,6 +1,7 @@
 // DiGi.GLTF.WebAPI — generic, reusable 3D glTF viewer engine.
 // Renders a GLTFScene payload (scene JSON + binary glTF) without any domain knowledge:
-// - Rendering pipeline: WebGL canvas, ground grid, shadows, autoframing camera, frustum culling.
+// - Rendering pipeline: WebGL canvas, ground plane + grid at world elevation Z = 0, shadows,
+//   autoframing camera, frustum culling.
 // - Batched payload support: geometry produced by the DiGi.GLTF batching pipeline arrives as one
 //   merged mesh per alpha mode with per-vertex object ids (_OBJECTID) and an objectMap in the
 //   scene extras. Individual objects are picked by decoding the id attribute at the raycast hit
@@ -18,13 +19,22 @@
 // - ViewCube: a Revit-style navigation gizmo in the bottom-right corner. Its orientation mirrors
 //   the main camera in real time; hovering highlights the face/edge/corner regions and clicking
 //   one smoothly aligns the camera to that direction around the current orbit target.
+// - Settings panel: built-in environment controls — "Show gizmo" and "Show ground" checkboxes
+//   (both checked by default), a "Fog" slider (default 0.2) driving an exponential distance fog,
+//   and a "View range" slider + numeric input (default 2000 m) that hides every object whose
+//   center lies further from the scene center than the given radius (batched payloads are culled
+//   by rebuilding the merged index buffer from the per-object contiguous index ranges; legacy
+//   payloads toggle mesh visibility). The controls mount into a host-provided '#gltf-settings'
+//   element when the page has one (the host owns the surrounding card/title/theming); otherwise
+//   the engine creates its own collapsible panel docked to the left edge titled "Settings".
 // Integration contract for consuming applications:
 // - Events dispatched on the container element:
 //   'gltf-ready'            detail: { objectCount }
 //   'gltf-selectionchanged' detail: { references: string[] } (generic object identifiers)
 // - Public API: frameScene(), frameSelection(), clearSelection(), getSunState(),
 //   setSun(azimuth, altitude), setSunIntensity(value), setAmbientIntensity(value),
-//   getUserData(reference), alignViewToDirection(direction).
+//   getUserData(reference), alignViewToDirection(direction), getEnvironmentState(),
+//   setGizmoVisible(visible), setGroundVisible(visible), setFog(value), setViewRange(meters).
 // - Right-click context menu: built-in default behavior with "Fit view", "Fit selection"
 //   (enabled only while objects are selected) and "Clear selection". Consuming applications may
 //   extend the `contextMenuItems` array ({ label, action(), isEnabled() }) before the first open.
@@ -58,6 +68,30 @@ const VIEW_CUBE_MARGIN = 12;
 const VIEW_CUBE_ALIGN_MS = 600;
 const VIEW_CUBE_HIGHLIGHT = 0x4d90fe;
 const VIEW_CUBE_HOVER_OPACITY = 0.4;
+
+// Ground plane at the DiGi world elevation Z = 0: a visible plate with the line grid and a
+// transparent shadow catcher stacked above it. The small Y offsets prevent z-fighting with
+// geometry that sits exactly on the ground. The plate color is a neutral dark gray kept clearly
+// lighter than the scene background so the ground reads as a solid surface.
+const GROUND_COLOR = 0x44464c;
+const GROUND_OFFSET = 0.06;
+const GROUND_SHADOW_OFFSET = 0.04;
+const GROUND_GRID_OFFSET = 0.02;
+
+// Settings panel defaults. The view range hides objects whose center lies further from the
+// scene center than the given radius in meters; fog is a normalized 0..1 slider value.
+const VIEW_RANGE_DEFAULT = 2000;
+const VIEW_RANGE_MIN = 100;
+const VIEW_RANGE_MAX = 10000;
+
+// FogExp2 factor exp(-(density * depth)^2) falls under ~1% at density * depth ≈ 2.15, so a fog
+// slider value of 1 places the fully fogged distance at the scene radius.
+const FOG_FALLOFF = 2.15;
+const FOG_DEFAULT = 0.1;
+
+// Debounce for rebuilding the raycast BVH and edge overlays after a view-range change; the
+// index rebuild itself is cheap and runs live while the slider moves.
+const CULL_REBUILD_DELAY_MS = 300;
 
 export function readSceneData(elementId) {
     const element = document.getElementById(elementId);
@@ -162,6 +196,16 @@ export class GltfViewer {
         this.lastHoverTime = 0;
         this.bvh = null;
 
+        // Environment settings driven by the built-in Settings panel (and the public setters).
+        this.environmentState = { gizmoVisible: true, groundVisible: true, fog: FOG_DEFAULT, viewRange: VIEW_RANGE_DEFAULT };
+        this.groundGroup = null;
+        this.hiddenIds = new Set();           // objects culled by the view range
+        this.cullingReady = false;            // per-object centers/index ranges are computed
+        this.cullRebuildTimer = null;
+        this.originalIndices = new Map();     // mesh -> TypedArray copy of the full index buffer
+        this.meshObjectIds = new Map();       // mesh -> object ids in index-buffer order (batched)
+        this.edgeOverlays = new Map();        // mesh -> LineSegments edge overlay
+
         // Default right-click context menu; consuming applications may extend this array before
         // the first open. Item shape: { label, action(), isEnabled() } — isEnabled is evaluated
         // each time the menu opens.
@@ -178,6 +222,7 @@ export class GltfViewer {
         this.initContextMenu();
         this.initPicking();
         this.initViewCube();
+        this.initSettingsPanel();
         this.loadGlb();
         this.animate();
     }
@@ -388,6 +433,7 @@ export class GltfViewer {
             this.computeBounds();
             this.addGroundAndGrid();
             this.setupLights();
+            this.applyFog();
             this.frameScene();
 
             this.container.dispatchEvent(new CustomEvent('gltf-ready', {
@@ -439,7 +485,11 @@ export class GltfViewer {
                     properties: entry.properties ?? null,
                     mesh: this.batchMeshes[entry.batchIndex] ?? null,
                     vertexStart: entry.vertexStart ?? 0,
-                    vertexCount: entry.vertexCount ?? 0
+                    vertexCount: entry.vertexCount ?? 0,
+                    // Culling metadata, filled by buildCullingData in the deferred pass.
+                    center: null,
+                    indexStart: 0,
+                    indexCount: 0
                 });
             }
             return;
@@ -465,20 +515,188 @@ export class GltfViewer {
                 properties: userData,
                 mesh: mesh,
                 vertexStart: 0,
-                vertexCount: mesh.geometry.getAttribute('position')?.count ?? 0
+                vertexCount: mesh.geometry.getAttribute('position')?.count ?? 0,
+                center: null,
+                indexStart: 0,
+                indexCount: 0
             });
         }
     }
 
+    // Deferred heavy work after the first presented frame: culling metadata, the initial view
+    // range application, then the raycast BVH and edge overlays (built last so they reflect the
+    // culled index buffers).
     buildDeferredStructures() {
-        const pickables = this.batched ? this.batchMeshes : this.objects.map((o) => o.mesh);
+        this.buildCullingData();
+        this.applyCulling();
+        this.rebuildAcceleration();
+    }
 
-        let totalTriangles = 0;
-        for (const mesh of pickables) {
-            if (mesh?.geometry?.index) {
-                totalTriangles += mesh.geometry.index.count / 3;
+    // Precomputes the per-object view-range culling metadata: the world-space center of every
+    // object (its bounding-box middle) and, for batched payloads, the contiguous index-buffer
+    // range of every object plus a copy of the full index buffer to rebuild filtered indices from.
+    buildCullingData() {
+        const vertex = new THREE.Vector3();
+
+        if (this.batched) {
+            for (const mesh of this.batchMeshes) {
+                const index = mesh.geometry.index;
+                const idAttribute = objectIdAttributeOf(mesh.geometry);
+                if (!index || !idAttribute) {
+                    continue;
+                }
+
+                this.originalIndices.set(mesh, index.array.slice());
+
+                // Objects occupy contiguous index ranges, so one pass over the triangles collecting
+                // the id runs yields every object's index range in buffer order.
+                const ids = [];
+                const array = index.array;
+                let runId = -1;
+                for (let i = 0; i < array.length; i += 3) {
+                    const id = Math.round(idAttribute.getX(array[i]));
+                    const object = this.objects[id];
+                    if (!object) {
+                        runId = -1;
+                        continue;
+                    }
+                    if (id !== runId) {
+                        ids.push(id);
+                        object.indexStart = i;
+                        object.indexCount = 0;
+                        runId = id;
+                    }
+                    object.indexCount += 3;
+                }
+                this.meshObjectIds.set(mesh, ids);
             }
         }
+
+        for (const object of this.objects) {
+            const mesh = object.mesh;
+            if (!mesh) {
+                continue;
+            }
+
+            if (this.batched) {
+                const position = mesh.geometry.getAttribute('position');
+                if (!position || object.vertexCount === 0) {
+                    continue;
+                }
+                mesh.updateWorldMatrix(true, false);
+                const box = new THREE.Box3();
+                const end = object.vertexStart + object.vertexCount;
+                for (let i = object.vertexStart; i < end; i++) {
+                    vertex.fromBufferAttribute(position, i).applyMatrix4(mesh.matrixWorld);
+                    box.expandByPoint(vertex);
+                }
+                object.center = box.getCenter(new THREE.Vector3());
+            } else {
+                object.center = new THREE.Box3().setFromObject(mesh).getCenter(new THREE.Vector3());
+            }
+        }
+
+        this.cullingReady = true;
+    }
+
+    // Applies the current view range: objects whose center lies further from the scene center
+    // than the range (horizontal distance — DiGi XY maps to three.js XZ) are hidden. Batched
+    // meshes are culled by rebuilding their index buffer from the visible objects' contiguous
+    // index ranges; legacy meshes simply toggle visibility. Hidden objects leave the selection
+    // and lose their hover state. Returns whether the hidden set changed.
+    applyCulling() {
+        if (!this.cullingReady) {
+            return false;
+        }
+
+        const range = this.environmentState.viewRange;
+        const hidden = new Set();
+        for (let id = 0; id < this.objects.length; id++) {
+            const center = this.objects[id].center;
+            if (center && Math.hypot(center.x - this.center.x, center.z - this.center.z) > range) {
+                hidden.add(id);
+            }
+        }
+
+        let changed = hidden.size !== this.hiddenIds.size;
+        if (!changed) {
+            for (const id of hidden) {
+                if (!this.hiddenIds.has(id)) {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        if (!changed) {
+            return false;
+        }
+
+        this.hiddenIds = hidden;
+
+        if (this.hoveredId !== null && hidden.has(this.hoveredId)) {
+            this.applyHighlight(this.hoveredId);
+            this.hoveredId = null;
+            this.hoverLabel.style.display = 'none';
+        }
+
+        if (this.batched) {
+            for (const mesh of this.batchMeshes) {
+                this.rebuildBatchIndex(mesh);
+            }
+        } else {
+            for (let id = 0; id < this.objects.length; id++) {
+                const mesh = this.objects[id].mesh;
+                if (mesh) {
+                    mesh.visible = !hidden.has(id);
+                }
+            }
+        }
+
+        if ([...this.selectedIds].some((id) => hidden.has(id))) {
+            this.select([...this.selectedIds].filter((id) => !hidden.has(id)));
+        }
+
+        return true;
+    }
+
+    // Rebuilds the merged index buffer of one batched mesh so it only contains the triangles of
+    // visible objects. The stale BVH is dropped immediately (the accelerated raycast falls back
+    // to the plain path until rebuildAcceleration recomputes it).
+    rebuildBatchIndex(mesh) {
+        const original = this.originalIndices.get(mesh);
+        const ids = this.meshObjectIds.get(mesh);
+        if (!original || !ids) {
+            return;
+        }
+
+        let count = 0;
+        for (const id of ids) {
+            if (!this.hiddenIds.has(id)) {
+                count += this.objects[id].indexCount;
+            }
+        }
+
+        const filtered = new original.constructor(count);
+        let offset = 0;
+        for (const id of ids) {
+            if (this.hiddenIds.has(id)) {
+                continue;
+            }
+            const object = this.objects[id];
+            filtered.set(original.subarray(object.indexStart, object.indexStart + object.indexCount), offset);
+            offset += object.indexCount;
+        }
+
+        mesh.geometry.setIndex(new THREE.BufferAttribute(filtered, 1));
+        if (mesh.geometry.boundsTree) {
+            mesh.geometry.disposeBoundsTree();
+        }
+    }
+
+    // (Re)builds the raycast BVH and the edge overlays from the current (possibly culled) index
+    // buffers. Runs deferred after load and debounced after view-range changes.
+    rebuildAcceleration() {
+        const pickables = this.batched ? this.batchMeshes : this.objects.map((o) => o.mesh);
 
         // Raycast acceleration (BVH) for large merged meshes.
         if (this.bvh) {
@@ -489,18 +707,39 @@ export class GltfViewer {
             }
         }
 
-        // Edge overlays for visual quality, skipped for extreme triangle counts.
-        if (totalTriangles <= EDGES_TRIANGLE_LIMIT) {
-            for (const mesh of pickables) {
-                if (!mesh?.geometry) {
-                    continue;
-                }
-                const edges = new THREE.LineSegments(
-                    new THREE.EdgesGeometry(mesh.geometry, 25),
-                    new THREE.LineBasicMaterial({ color: 0x11141b, transparent: true, opacity: 0.55 }));
-                edges.raycast = () => { };
-                mesh.add(edges);
+        this.buildEdgeOverlays(pickables);
+    }
+
+    // Edge overlays for visual quality, skipped for extreme triangle counts. Existing overlays
+    // are disposed first so the edges always match the current index buffers.
+    buildEdgeOverlays(meshes) {
+        for (const [mesh, edges] of this.edgeOverlays) {
+            mesh.remove(edges);
+            edges.geometry.dispose();
+            edges.material.dispose();
+        }
+        this.edgeOverlays.clear();
+
+        let totalTriangles = 0;
+        for (const mesh of meshes) {
+            if (mesh?.geometry?.index) {
+                totalTriangles += mesh.geometry.index.count / 3;
             }
+        }
+        if (totalTriangles > EDGES_TRIANGLE_LIMIT) {
+            return;
+        }
+
+        for (const mesh of meshes) {
+            if (!mesh?.geometry) {
+                continue;
+            }
+            const edges = new THREE.LineSegments(
+                new THREE.EdgesGeometry(mesh.geometry, 25),
+                new THREE.LineBasicMaterial({ color: 0x11141b, transparent: true, opacity: 0.55 }));
+            edges.raycast = () => { };
+            mesh.add(edges);
+            this.edgeOverlays.set(mesh, edges);
         }
     }
 
@@ -513,20 +752,38 @@ export class GltfViewer {
         this.radius = Math.max(1, box.getSize(new THREE.Vector3()).length() / 2);
     }
 
+    // Ground group at the DiGi world elevation Z = 0: a visible ground plate, the line grid and a
+    // transparent shadow catcher. The scene is translated by the reference point and rotated to
+    // Y-up, so world Z = 0 sits at three.js y = -ReferencePoint.Z. Everything lives in one group
+    // toggled by the "Show ground" setting; none of it is pickable (only this.root meshes are).
     addGroundAndGrid() {
         const size = this.radius * 8;
+        const elevation = -(this.sceneData.ReferencePoint?.Z ?? 0);
 
-        const grid = new THREE.GridHelper(size, 40, 0x39404f, 0x232833);
-        grid.position.y = -0.02;
-        this.scene.add(grid);
+        this.groundGroup = new THREE.Group();
+        this.groundGroup.visible = this.environmentState.groundVisible;
 
         const ground = new THREE.Mesh(
             new THREE.PlaneGeometry(size, size),
-            new THREE.ShadowMaterial({ opacity: 0.35 }));
+            new THREE.MeshLambertMaterial({ color: GROUND_COLOR }));
         ground.rotation.x = -Math.PI / 2;
-        ground.position.y = -0.01;
+        ground.position.set(this.center.x, elevation - GROUND_OFFSET, this.center.z);
         ground.receiveShadow = true;
-        this.scene.add(ground);
+        this.groundGroup.add(ground);
+
+        const grid = new THREE.GridHelper(size, 40, 0x39404f, 0x232833);
+        grid.position.set(this.center.x, elevation - GROUND_GRID_OFFSET, this.center.z);
+        this.groundGroup.add(grid);
+
+        const shadowCatcher = new THREE.Mesh(
+            new THREE.PlaneGeometry(size, size),
+            new THREE.ShadowMaterial({ opacity: 0.35 }));
+        shadowCatcher.rotation.x = -Math.PI / 2;
+        shadowCatcher.position.set(this.center.x, elevation - GROUND_SHADOW_OFFSET, this.center.z);
+        shadowCatcher.receiveShadow = true;
+        this.groundGroup.add(shadowCatcher);
+
+        this.scene.add(this.groundGroup);
     }
 
     setupLights() {
@@ -622,6 +879,54 @@ export class GltfViewer {
     setAmbientIntensity(intensity) {
         this.sunState.ambientIntensity = intensity;
         this.applySunState();
+    }
+
+    getEnvironmentState() {
+        return { ...this.environmentState };
+    }
+
+    setGizmoVisible(visible) {
+        this.environmentState.gizmoVisible = !!visible;
+        if (this.viewCubeRenderer) {
+            this.viewCubeRenderer.domElement.style.display = this.environmentState.gizmoVisible ? 'block' : 'none';
+        }
+    }
+
+    setGroundVisible(visible) {
+        this.environmentState.groundVisible = !!visible;
+        if (this.groundGroup) {
+            this.groundGroup.visible = this.environmentState.groundVisible;
+        }
+    }
+
+    // Normalized fog control: 0 disables the fog, 1 places the fully fogged distance at the
+    // scene radius. The fog color matches the scene background so distant areas dissolve into it.
+    setFog(value) {
+        this.environmentState.fog = THREE.MathUtils.clamp(Number(value) || 0, 0, 1);
+        this.applyFog();
+    }
+
+    applyFog() {
+        const value = this.environmentState.fog;
+        this.scene.fog = value > 0
+            ? new THREE.FogExp2(0x171a21, value * FOG_FALLOFF / Math.max(this.radius, 1))
+            : null;
+    }
+
+    // View range in meters (default 2000): objects whose center lies further from the scene
+    // center than the range are not rendered. The index rebuild runs immediately; the expensive
+    // BVH/edge-overlay rebuild is debounced so slider drags stay responsive.
+    setViewRange(range) {
+        const value = Number(range);
+        if (!isFinite(value) || value <= 0) {
+            return;
+        }
+
+        this.environmentState.viewRange = value;
+        if (this.applyCulling()) {
+            clearTimeout(this.cullRebuildTimer);
+            this.cullRebuildTimer = setTimeout(() => this.rebuildAcceleration(), CULL_REBUILD_DELAY_MS);
+        }
     }
 
     frameScene() {
@@ -888,6 +1193,9 @@ export class GltfViewer {
 
         const screenBounds = new Array(this.objects.length).fill(null);
         for (let id = 0; id < this.objects.length; id++) {
+            if (this.hiddenIds.has(id)) {
+                continue;
+            }
             const object = this.objects[id];
             const mesh = object.mesh;
             const positionAttribute = mesh?.geometry?.getAttribute('position');
@@ -960,7 +1268,9 @@ export class GltfViewer {
         const intersection = intersections[0];
         if (!this.batched) {
             const id = this.meshObjects.get(intersection.object);
-            return id === undefined ? null : id;
+            // The raycaster does not honor mesh visibility, so view-range hidden objects are
+            // filtered here.
+            return id === undefined || this.hiddenIds.has(id) ? null : id;
         }
 
         const idAttribute = objectIdAttributeOf(intersection.object.geometry);
@@ -968,7 +1278,10 @@ export class GltfViewer {
             return null;
         }
 
-        return Math.round(idAttribute.getX(intersection.face.a));
+        // Culled triangles are absent from the rebuilt index, but a stale BVH can still report
+        // them between an index rebuild and the debounced BVH rebuild.
+        const id = Math.round(idAttribute.getX(intersection.face.a));
+        return this.hiddenIds.has(id) ? null : id;
     }
 
     updateHover(event) {
@@ -1297,6 +1610,153 @@ export class GltfViewer {
         this.viewCubeCamera.lookAt(0, 0, 0);
 
         this.viewCubeRenderer.render(this.viewCubeScene, this.viewCubeCamera);
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Settings panel with the environment controls (gizmo/ground visibility, fog, view range).
+    // When the host page provides an element with id 'gltf-settings' (typically inside its own
+    // left side panel card), the controls mount there and inherit the host theme. Without one,
+    // the engine creates its own collapsible panel docked to the left edge of the viewport with
+    // inline styling like the other overlays, so every consuming application gets the settings
+    // by default without stylesheet support; hosts may reposition it through `this.settingsPanel`.
+    // ------------------------------------------------------------------------------------------
+    initSettingsPanel() {
+        const hostElement = document.getElementById('gltf-settings');
+        const floating = !hostElement;
+        let content;
+
+        if (floating) {
+            this.settingsPanel = document.createElement('div');
+            Object.assign(this.settingsPanel.style, {
+                // Offset below the top-left corner so host-owned buttons (panel toggles) stay reachable.
+                position: 'absolute', left: '12px', top: '54px', zIndex: '6', width: '200px',
+                borderRadius: '6px', background: 'rgba(20, 24, 32, 0.92)',
+                border: '1px solid rgba(255, 255, 255, 0.08)', boxShadow: '0 4px 16px rgba(0, 0, 0, 0.45)',
+                color: '#e6e9ef', fontSize: '0.8rem', userSelect: 'none'
+            });
+            this.container.appendChild(this.settingsPanel);
+
+            const header = document.createElement('div');
+            Object.assign(header.style, {
+                display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                padding: '8px 12px', fontWeight: '600', cursor: 'pointer',
+                borderBottom: '1px solid rgba(255, 255, 255, 0.08)'
+            });
+            const title = document.createElement('span');
+            title.textContent = 'Settings';
+            const chevron = document.createElement('span');
+            chevron.textContent = '▾';
+            chevron.style.opacity = '0.7';
+            header.appendChild(title);
+            header.appendChild(chevron);
+            this.settingsPanel.appendChild(header);
+
+            content = document.createElement('div');
+            Object.assign(content.style, {
+                display: 'flex', flexDirection: 'column', gap: '10px', padding: '10px 12px'
+            });
+            this.settingsPanel.appendChild(content);
+
+            header.addEventListener('click', () => {
+                const collapsed = content.style.display === 'none';
+                content.style.display = collapsed ? 'flex' : 'none';
+                chevron.textContent = collapsed ? '▾' : '▸';
+                header.style.borderBottom = collapsed ? '1px solid rgba(255, 255, 255, 0.08)' : 'none';
+            });
+        } else {
+            this.settingsPanel = hostElement;
+            content = hostElement;
+            Object.assign(content.style, { display: 'flex', flexDirection: 'column', gap: '10px' });
+        }
+
+        const checkboxRow = (label, checked, onChange) => {
+            const row = document.createElement('label');
+            Object.assign(row.style, { display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer' });
+            const input = document.createElement('input');
+            input.type = 'checkbox';
+            input.checked = checked;
+            input.style.accentColor = '#4d90fe';
+            input.addEventListener('change', () => onChange(input.checked));
+            row.appendChild(input);
+            row.appendChild(document.createTextNode(label));
+            content.appendChild(row);
+            return input;
+        };
+
+        const sliderLabel = (label) => {
+            const wrapper = document.createElement('label');
+            // Generic class hook so a themed host styles the rows like its own slider labels.
+            wrapper.className = 'gltf-slider-label';
+            Object.assign(wrapper.style, { display: 'flex', flexDirection: 'column', gap: '4px' });
+            const caption = document.createElement('span');
+            caption.textContent = label;
+            wrapper.appendChild(caption);
+            content.appendChild(wrapper);
+            return wrapper;
+        };
+
+        checkboxRow('Show gizmo', this.environmentState.gizmoVisible, (checked) => this.setGizmoVisible(checked));
+        checkboxRow('Show ground', this.environmentState.groundVisible, (checked) => this.setGroundVisible(checked));
+
+        const fogWrapper = sliderLabel('Fog');
+        const fogInput = document.createElement('input');
+        fogInput.type = 'range';
+        fogInput.min = '0';
+        fogInput.max = '1';
+        fogInput.step = '0.01';
+        fogInput.value = String(this.environmentState.fog);
+        fogInput.style.width = '100%';
+        fogInput.addEventListener('input', () => this.setFog(parseFloat(fogInput.value)));
+        fogWrapper.appendChild(fogInput);
+
+        const rangeWrapper = sliderLabel('View range');
+        const rangeSlider = document.createElement('input');
+        rangeSlider.type = 'range';
+        rangeSlider.min = String(VIEW_RANGE_MIN);
+        rangeSlider.max = String(VIEW_RANGE_MAX);
+        rangeSlider.step = '50';
+        rangeSlider.value = String(this.environmentState.viewRange);
+        rangeSlider.style.width = '100%';
+        rangeWrapper.appendChild(rangeSlider);
+
+        const rangeRow = document.createElement('div');
+        Object.assign(rangeRow.style, { display: 'flex', alignItems: 'center', gap: '6px' });
+        const rangeNumber = document.createElement('input');
+        rangeNumber.type = 'number';
+        rangeNumber.min = '1';
+        rangeNumber.step = '50';
+        rangeNumber.value = String(this.environmentState.viewRange);
+        Object.assign(rangeNumber.style, { width: '80px', padding: '2px 6px', borderRadius: '4px' });
+        if (floating) {
+            // Dark chrome colors only for the engine-owned panel; hosted mode inherits the host theme.
+            Object.assign(rangeNumber.style, {
+                border: '1px solid rgba(255, 255, 255, 0.15)', background: 'rgba(255, 255, 255, 0.06)',
+                color: '#e6e9ef', fontSize: '0.8rem'
+            });
+        }
+        const rangeUnit = document.createElement('span');
+        rangeUnit.textContent = 'm';
+        rangeUnit.style.opacity = '0.7';
+        rangeRow.appendChild(rangeNumber);
+        rangeRow.appendChild(rangeUnit);
+        rangeWrapper.appendChild(rangeRow);
+
+        rangeSlider.addEventListener('input', () => {
+            rangeNumber.value = rangeSlider.value;
+            this.setViewRange(parseFloat(rangeSlider.value));
+        });
+
+        // The numeric input accepts values beyond the slider bounds; the slider just clamps its
+        // thumb to the closest position.
+        rangeNumber.addEventListener('change', () => {
+            const value = parseFloat(rangeNumber.value);
+            if (!isFinite(value) || value <= 0) {
+                rangeNumber.value = String(this.environmentState.viewRange);
+                return;
+            }
+            rangeSlider.value = String(THREE.MathUtils.clamp(value, VIEW_RANGE_MIN, VIEW_RANGE_MAX));
+            this.setViewRange(value);
+        });
     }
 
     animate() {
