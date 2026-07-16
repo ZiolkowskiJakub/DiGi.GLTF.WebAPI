@@ -215,6 +215,29 @@ export function reportStatus(message) {
     document.dispatchEvent(new CustomEvent('gltf-status', { detail: { message: entry.text, time: entry.time } }));
 }
 
+export function updateLastStatus(message) {
+    if (message === undefined || message === null || message === '') {
+        return;
+    }
+
+    const text = String(message);
+    if (statusHistory.length > 0) {
+        statusHistory[statusHistory.length - 1].text = text;
+    }
+
+    document.dispatchEvent(new CustomEvent('gltf-status-update', { detail: { message: text } }));
+}
+
+export function formatElapsed(startTime) {
+    const elapsed = (performance.now() - startTime) / 1000;
+    if (elapsed < 60) {
+        return `${elapsed.toFixed(1)}s`;
+    }
+    const minutes = Math.floor(elapsed / 60);
+    const seconds = Math.floor(elapsed % 60);
+    return `${minutes}m ${seconds}s`;
+}
+
 export class GltfStatusTerminal {
     // One terminal per container: repeated attach calls return the existing instance. The boolean
     // visibility flag disables the feature entirely - data-status-terminal="false" on the
@@ -281,6 +304,9 @@ export class GltfStatusTerminal {
             text: event.detail?.message ?? ''
         });
         document.addEventListener('gltf-status', this.statusListener);
+
+        this.statusUpdateListener = (event) => this.updateLastLine(event.detail?.message ?? '');
+        document.addEventListener('gltf-status-update', this.statusUpdateListener);
 
         for (const entry of statusHistory) {
             this.appendLine(entry);
@@ -355,6 +381,24 @@ export class GltfStatusTerminal {
         this.textArea.scrollTop = this.textArea.scrollHeight;
     }
 
+    updateLastLine(text) {
+        if (!text) {
+            return;
+        }
+
+        const lastLine = this.textArea.lastElementChild;
+        if (!lastLine) {
+            this.appendLine({ time: new Date(), text });
+            return;
+        }
+
+        const textSpan = lastLine.lastElementChild;
+        if (textSpan) {
+            textSpan.textContent = text;
+        }
+        lastLine.title = text;
+    }
+
     // Reports a task status to this terminal only; reportStatus() broadcasts to all terminals.
     log(message) {
         if (message !== undefined && message !== null && message !== '') {
@@ -393,6 +437,7 @@ export class GltfStatusTerminal {
 
     dispose() {
         document.removeEventListener('gltf-status', this.statusListener);
+        document.removeEventListener('gltf-status-update', this.statusUpdateListener);
         this.wrapper.remove();
         this.hidden = true;
         this.dispatchResize();
