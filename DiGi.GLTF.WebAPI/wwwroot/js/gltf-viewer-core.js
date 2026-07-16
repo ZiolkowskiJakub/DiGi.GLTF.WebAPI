@@ -468,7 +468,7 @@ export class GltfViewer {
         this.bvh = null;
 
         // Environment settings driven by the built-in Settings panel (and the public setters).
-        this.environmentState = { gizmoVisible: true, groundVisible: true, fog: FOG_DEFAULT, viewRange: VIEW_RANGE_DEFAULT };
+        this.environmentState = { gizmoVisible: true, groundVisible: true, terminalVisible: true, fog: FOG_DEFAULT, viewRange: VIEW_RANGE_DEFAULT };
         this.groundGroup = null;
         this.hiddenIds = new Set();           // objects culled by the view range
         this.cullingReady = false;            // per-object centers/index ranges are computed
@@ -493,8 +493,8 @@ export class GltfViewer {
         this.initContextMenu();
         this.initPicking();
         this.initViewCube();
-        this.initSettingsPanel();
         this.initStatusTerminal();
+        this.initSettingsPanel();
         this.loadGlb();
         this.animate();
     }
@@ -1984,6 +1984,10 @@ export class GltfViewer {
 
         checkboxRow('Show gizmo', this.environmentState.gizmoVisible, (checked) => this.setGizmoVisible(checked));
         checkboxRow('Show ground', this.environmentState.groundVisible, (checked) => this.setGroundVisible(checked));
+        checkboxRow('Show terminal', this.environmentState.terminalVisible, (checked) => {
+            this.environmentState.terminalVisible = checked;
+            this.statusTerminal?.setVisible(checked);
+        });
 
         const fogWrapper = sliderLabel('Fog');
         const fogInput = document.createElement('input');
