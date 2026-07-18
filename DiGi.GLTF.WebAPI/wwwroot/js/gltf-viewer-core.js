@@ -1593,7 +1593,7 @@ export class GltfViewer {
             this.applyHighlight(id, this.selectedIds.has(id) ? SELECTED_TINT : HOVER_TINT);
             this.renderer.domElement.style.cursor = 'pointer';
             this.hoverLabel.style.display = 'block';
-            this.hoverLabel.textContent = this.objects[id].reference || this.objects[id].name || 'Object';
+            this.hoverLabel.textContent = this.objects[id].name || 'Object';
         } else {
             this.renderer.domElement.style.cursor = 'default';
             this.hoverLabel.style.display = 'none';
