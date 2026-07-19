@@ -33,15 +33,26 @@
 //   appears once the area is expanded beyond three lines. Any code reports the current task via
 //   the exported reportStatus(message) (or the 'gltf-status' document event); the boolean flag
 //   data-status-terminal="false" on the container removes the text area and splitter entirely.
+// - Scope box: a Revit-style manipulable clipping cuboid ("Scope Box" / "Scope Box visible"
+//   checkboxes in the Settings panel). When enabled, six GPU clipping planes restrict rendering
+//   to the box interior and geometry crossing the boundary is cut live (open cross-sections,
+//   like a plain clipped view). Dragging an edge moves
+//   the box, clicking an edge reveals per-face push/pull arrows and a rotate handle (rotation
+//   is about the vertical axis, like Revit). Hiding the box (visible = false) keeps the
+//   clipping and the caps active. The default box is centered on the scene; the container
+//   attribute data-scope-box-size="halfX;halfY;zMin;zMax" (DiGi coordinates) overrides the
+//   bounds-fit default per view.
 // Integration contract for consuming applications:
 // - Events dispatched on the container element:
 //   'gltf-ready'            detail: { objectCount }
 //   'gltf-selectionchanged' detail: { references: string[] } (generic object identifiers)
 //   'gltf-terminalresize'   detail: { height } (status terminal height in CSS pixels; 0 = hidden)
+//   'gltf-scopeboxchanged'  detail: { enabled, visible, center, size, rotation } (DiGi coordinates)
 // - Public API: frameScene(), frameSelection(), clearSelection(), getSunState(),
 //   setSun(azimuth, altitude), setSunIntensity(value), setAmbientIntensity(value),
 //   getUserData(reference), alignViewToDirection(direction), getEnvironmentState(),
-//   setGizmoVisible(visible), setGroundVisible(visible), setFog(value), setViewRange(meters).
+//   setGizmoVisible(visible), setGroundVisible(visible), setFog(value), setViewRange(meters),
+//   setScopeBoxEnabled(enabled), setScopeBoxVisible(visible), getScopeBoxState().
 // - Right-click context menu: built-in default behavior with "Fit view", "Fit selection"
 //   (enabled only while objects are selected) and "Clear selection". Consuming applications may
 //   extend the `contextMenuItems` array ({ label, action(), isEnabled() }) before the first open.
@@ -99,6 +110,18 @@ const FOG_DEFAULT = 0.1;
 // Debounce for rebuilding the raycast BVH and edge overlays after a view-range change; the
 // index rebuild itself is cheap and runs live while the slider moves.
 const CULL_REBUILD_DELAY_MS = 300;
+
+// Scope box: the Revit-style clipping cuboid. Cyan wireframe/handles, a screen-relative handle
+// scale (fraction of the vertical view extent at the handle distance), a minimum face-to-face
+// size in meters and the pick-proxy thickness of the edges as a fraction of the box diagonal.
+const SCOPE_BOX_COLOR = 0x00e0e0;
+const SCOPE_BOX_HANDLE_SIZE = 0.025;
+const SCOPE_BOX_MIN_SIZE = 0.5;
+const SCOPE_BOX_EDGE_PICK_RATIO = 0.015;
+
+// The six box faces as [axis, sign] pairs in box-local coordinates (axis 0 = x, 1 = y, 2 = z).
+// The order fixes the mapping between faces, clipping planes, handles and cap quads.
+const SCOPE_BOX_FACES = [[0, 1], [0, -1], [1, 1], [1, -1], [2, 1], [2, -1]];
 
 // Status terminal: height of one log line and of the splitter bar in CSS pixels, the visible
 // line count above which the vertical scrollbar appears, the share of the container height the
@@ -468,8 +491,23 @@ export class GltfViewer {
         this.bvh = null;
 
         // Environment settings driven by the built-in Settings panel (and the public setters).
-        this.environmentState = { gizmoVisible: true, groundVisible: true, terminalVisible: true, fog: FOG_DEFAULT, viewRange: VIEW_RANGE_DEFAULT };
+        this.environmentState = { gizmoVisible: true, groundVisible: true, terminalVisible: true, fog: FOG_DEFAULT, viewRange: VIEW_RANGE_DEFAULT, scopeBoxEnabled: false, scopeBoxVisible: true };
         this.groundGroup = null;
+
+        // Scope box: the six shared clipping planes are created once and mutated in place, so
+        // every clipped material follows box drags without per-material updates. The box state
+        // { center, halfExtents, quaternion } (three.js world space) is the single source of
+        // truth for the visuals, the pick proxies, the caps and the planes; it stays null until
+        // the first activation and survives disable/enable cycles.
+        this.scopeBoxState = null;
+        this.scopeBoxPlanes = [...Array(6)].map(() => new THREE.Plane());
+        this.scopeBoxGroup = null;            // wireframe + handles + pick proxies (box transform)
+        this.scopeBoxHandles = [];            // face push/pull arrow sprites
+        this.scopeBoxRotateHandle = null;
+        this.scopeBoxProxies = [];            // invisible raycast targets (edges, handle spheres)
+        this.scopeBoxDrag = null;             // active drag descriptor, null when idle
+        this.scopeBoxSelected = false;        // face/rotate gizmos revealed
+        this.scopeBoxPending = false;         // enabled before the GLB finished loading
         this.hiddenIds = new Set();           // objects culled by the view range
         this.cullingReady = false;            // per-object centers/index ranges are computed
         this.cullRebuildTimer = null;
@@ -491,6 +529,9 @@ export class GltfViewer {
         this.initScene();
         this.initCameraAndControls();
         this.initContextMenu();
+        // Scope box listeners register before the picking listeners on the same canvas so a box
+        // interaction can consume the event (stopImmediatePropagation) before picking sees it.
+        this.initScopeBox();
         this.initPicking();
         this.initViewCube();
         this.initStatusTerminal();
@@ -515,7 +556,9 @@ export class GltfViewer {
     }
 
     initRenderer() {
+        // Local clipping (scope box) is free while no material carries clipping planes.
         this.renderer = new THREE.WebGLRenderer({ antialias: true });
+        this.renderer.localClippingEnabled = true;
         this.renderer.setPixelRatio(window.devicePixelRatio);
         this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
         this.renderer.shadowMap.enabled = true;
@@ -718,6 +761,14 @@ export class GltfViewer {
 
             this.prepareMeshes(gltf);
             this.computeBounds();
+
+            // The scope box was enabled before the payload arrived: the default box needs the
+            // scene bounds, so the activation completes here.
+            if (this.scopeBoxPending) {
+                this.scopeBoxPending = false;
+                this.setScopeBoxEnabled(true);
+            }
+
             this.addGroundAndGrid();
             this.setupLights();
             this.applyFog();
@@ -1028,6 +1079,10 @@ export class GltfViewer {
             mesh.add(edges);
             this.edgeOverlays.set(mesh, edges);
         }
+
+        // Overlays are rebuilt after view-range changes; the fresh line materials must pick up
+        // the current scope box clipping state (a no-op null assignment when disabled).
+        this.applyScopeBoxClipping();
     }
 
     computeBounds() {
@@ -1311,6 +1366,11 @@ export class GltfViewer {
         const dom = this.renderer.domElement;
 
         dom.addEventListener('pointermove', (event) => {
+            // Scope box drags own the pointer (their handlers registered first and stop
+            // propagation); the guard keeps picking inert even if an event slips through.
+            if (this.scopeBoxDrag) {
+                return;
+            }
             if (this.marqueeStart) {
                 this.updateMarquee(event);
                 return;
@@ -1320,7 +1380,7 @@ export class GltfViewer {
         });
 
         dom.addEventListener('pointerdown', (event) => {
-            if (event.button !== 0) {
+            if (event.button !== 0 || this.scopeBoxDrag) {
                 return;
             }
             this.marqueeStart = this.containerPosition(event);
@@ -1336,7 +1396,7 @@ export class GltfViewer {
         });
 
         dom.addEventListener('pointerup', (event) => {
-            if (event.button !== 0 || !this.marqueeStart) {
+            if (event.button !== 0 || !this.marqueeStart || this.scopeBoxDrag) {
                 return;
             }
 
@@ -1466,6 +1526,16 @@ export class GltfViewer {
             }
         }
 
+        // With an active scope box, objects whose center lies outside the box are not marquee
+        // selectable (boundary-straddling objects with an outside center are a documented
+        // approximation; click picking still reaches their visible interior parts).
+        if (this.environmentState.scopeBoxEnabled && this.scopeBoxState !== null && this.cullingReady) {
+            return selected.filter((id) => {
+                const center = this.objects[id]?.center;
+                return center && this.scopeBoxContains(center);
+            });
+        }
+
         return selected;
     }
 
@@ -1541,34 +1611,41 @@ export class GltfViewer {
     }
 
     // Picks the object id under the pointer. For batched payloads the id is decoded from the
-    // _OBJECTID vertex attribute at the raycast hit face.
+    // _OBJECTID vertex attribute at the raycast hit face. With an active scope box the raycast
+    // walks all hits and takes the first one inside the box: a first-hit-only BVH result could
+    // be a clipped-away fragment in front of the visible geometry.
     pick() {
-        this.raycaster.firstHitOnly = !!this.bvh;
+        const scopeBoxActive = this.environmentState.scopeBoxEnabled && this.scopeBoxState !== null;
+        this.raycaster.firstHitOnly = !!this.bvh && !scopeBoxActive;
 
         const pickables = this.batched ? this.batchMeshes : this.objects.map((o) => o.mesh);
         this.raycaster.setFromCamera(this.pointer, this.camera);
         const intersections = this.raycaster.intersectObjects(pickables, false);
-        if (intersections.length === 0) {
-            return null;
+
+        for (const intersection of intersections) {
+            if (scopeBoxActive && !this.scopeBoxContains(intersection.point)) {
+                continue;
+            }
+
+            if (!this.batched) {
+                const id = this.meshObjects.get(intersection.object);
+                // The raycaster does not honor mesh visibility, so view-range hidden objects are
+                // filtered here.
+                return id === undefined || this.hiddenIds.has(id) ? null : id;
+            }
+
+            const idAttribute = objectIdAttributeOf(intersection.object.geometry);
+            if (!idAttribute || !intersection.face) {
+                return null;
+            }
+
+            // Culled triangles are absent from the rebuilt index, but a stale BVH can still report
+            // them between an index rebuild and the debounced BVH rebuild.
+            const id = Math.round(idAttribute.getX(intersection.face.a));
+            return this.hiddenIds.has(id) ? null : id;
         }
 
-        const intersection = intersections[0];
-        if (!this.batched) {
-            const id = this.meshObjects.get(intersection.object);
-            // The raycaster does not honor mesh visibility, so view-range hidden objects are
-            // filtered here.
-            return id === undefined || this.hiddenIds.has(id) ? null : id;
-        }
-
-        const idAttribute = objectIdAttributeOf(intersection.object.geometry);
-        if (!idAttribute || !intersection.face) {
-            return null;
-        }
-
-        // Culled triangles are absent from the rebuilt index, but a stale BVH can still report
-        // them between an index rebuild and the debounced BVH rebuild.
-        const id = Math.round(idAttribute.getX(intersection.face.a));
-        return this.hiddenIds.has(id) ? null : id;
+        return null;
     }
 
     updateHover(event) {
@@ -1900,6 +1977,598 @@ export class GltfViewer {
     }
 
     // ------------------------------------------------------------------------------------------
+    // Scope box: a Revit-style clipping cuboid. Six world-space clipping planes (shared Plane
+    // instances mutated in place, so every clipped material follows drags for free) restrict
+    // rendering to the box interior; geometry crossing the boundary is cut open, exactly like a
+    // plain clipped view. The visuals live in scopeBoxGroup: the cyan wireframe, the push/pull
+    // and rotate handle sprites and the invisible raycast proxies (box transform, hidden by
+    // "Scope Box visible" while the clipping stays active).
+    // Interactions: press-drag an edge moves the box on a camera-facing plane, a click on an
+    // edge toggles the gizmos, dragging a face arrow pushes/pulls that face along its normal
+    // (opposite face fixed) and the rotate handle spins the box about the vertical axis.
+    // ------------------------------------------------------------------------------------------
+    initScopeBox() {
+        this.scopeBoxRaycaster = new THREE.Raycaster();
+
+        const dom = this.renderer.domElement;
+
+        dom.addEventListener('pointerdown', (event) => {
+            if (event.button !== 0 || !this.scopeBoxInteractive()) {
+                return;
+            }
+            const hit = this.pickScopeBoxPart(event);
+            if (!hit) {
+                // Clicking empty space or model geometry hides the gizmos; the event continues
+                // to the picking handlers so object selection keeps working.
+                this.setScopeBoxSelected(false);
+                return;
+            }
+            event.stopImmediatePropagation();
+            this.startScopeBoxDrag(hit, event);
+        });
+
+        dom.addEventListener('pointermove', (event) => {
+            if (this.scopeBoxDrag) {
+                event.stopImmediatePropagation();
+                this.updateScopeBoxDrag(event);
+                return;
+            }
+            // Hover feedback only while no marquee is active (the marquee owns the pointer).
+            if (!this.scopeBoxInteractive() || this.marqueeStart) {
+                return;
+            }
+            const hit = this.pickScopeBoxPart(event);
+            if (hit) {
+                event.stopImmediatePropagation();
+                dom.style.cursor = hit.part.type === 'edge' ? 'move' : 'pointer';
+                this.hoverLabel.style.display = 'none';
+            }
+        });
+
+        dom.addEventListener('pointerup', (event) => {
+            if (event.button !== 0 || !this.scopeBoxDrag) {
+                return;
+            }
+            event.stopImmediatePropagation();
+            this.endScopeBoxDrag(event);
+        });
+    }
+
+    scopeBoxInteractive() {
+        return this.environmentState.scopeBoxEnabled && this.scopeBoxState !== null
+            && this.scopeBoxGroup !== null && this.scopeBoxGroup.visible;
+    }
+
+    // Ground elevation convention shared with addGroundAndGrid: DiGi world Z = 0 sits at
+    // three.js y = -ReferencePoint.Z.
+    scopeBoxElevation() {
+        return -(this.sceneData.ReferencePoint?.Z ?? 0);
+    }
+
+    setScopeBoxEnabled(enabled) {
+        const value = !!enabled;
+        this.environmentState.scopeBoxEnabled = value;
+
+        if (value && !this.root) {
+            // The GLB has not been parsed yet; the default box needs the scene bounds, so the
+            // activation completes in loadGlb.
+            this.scopeBoxPending = true;
+            this.dispatchScopeBoxChanged();
+            return;
+        }
+        this.scopeBoxPending = false;
+
+        if (value) {
+            if (!this.scopeBoxState) {
+                this.initializeScopeBoxDefaults();
+            }
+            this.ensureScopeBoxGroup();
+            this.updateScopeBoxVisuals();
+        } else {
+            this.setScopeBoxSelected(false);
+            this.scopeBoxDrag = null;
+        }
+
+        if (this.scopeBoxGroup) {
+            this.scopeBoxGroup.visible = value && this.environmentState.scopeBoxVisible;
+        }
+        this.applyScopeBoxClipping();
+        this.dispatchScopeBoxChanged();
+    }
+
+    // Hides only the box visuals (wireframe, handles); the clipping planes stay active.
+    setScopeBoxVisible(visible) {
+        this.environmentState.scopeBoxVisible = !!visible;
+        if (this.scopeBoxGroup) {
+            this.scopeBoxGroup.visible = this.environmentState.scopeBoxEnabled && this.environmentState.scopeBoxVisible;
+            if (!this.scopeBoxGroup.visible) {
+                this.setScopeBoxSelected(false);
+            }
+        }
+        this.dispatchScopeBoxChanged();
+    }
+
+    // Reports the box in DiGi Z-up coordinates: three.js world (x, y, z) -> DiGi
+    // (x, -z, y - elevation); the rotation about the vertical axis carries over sign-identically.
+    getScopeBoxState() {
+        const { scopeBoxEnabled, scopeBoxVisible } = this.environmentState;
+        if (!this.scopeBoxState) {
+            return { enabled: scopeBoxEnabled, visible: scopeBoxVisible, center: null, size: null, rotation: 0 };
+        }
+
+        const { center, halfExtents, quaternion } = this.scopeBoxState;
+        const elevation = this.scopeBoxElevation();
+        return {
+            enabled: scopeBoxEnabled,
+            visible: scopeBoxVisible,
+            center: { X: center.x, Y: -center.z, Z: center.y - elevation },
+            size: { X: halfExtents.x * 2, Y: halfExtents.z * 2, Z: halfExtents.y * 2 },
+            rotation: THREE.MathUtils.radToDeg(2 * Math.atan2(quaternion.y, quaternion.w))
+        };
+    }
+
+    dispatchScopeBoxChanged() {
+        this.container.dispatchEvent(new CustomEvent('gltf-scopeboxchanged', { detail: this.getScopeBoxState() }));
+    }
+
+    // "halfX;halfY;zMin;zMax" in DiGi coordinates from data-scope-box-size, or null when the
+    // attribute is missing or malformed (the bounds-fit default applies then).
+    parseScopeBoxPreset(text) {
+        const parts = (text ?? '').split(';').map(Number);
+        if (parts.length !== 4 || parts.some((part) => !isFinite(part)) || parts[0] <= 0 || parts[1] <= 0 || parts[3] <= parts[2]) {
+            return null;
+        }
+        return { halfX: parts[0], halfY: parts[1], zMin: parts[2], zMax: parts[3] };
+    }
+
+    // First-activation default: the per-view preset centered on the scene (DiGi X half extent ->
+    // three x, DiGi Y -> three z, DiGi Z range -> three y above the ground elevation), or a
+    // bounds fit of the loaded model with a small margin.
+    initializeScopeBoxDefaults() {
+        const preset = this.parseScopeBoxPreset(this.container.dataset.scopeBoxSize);
+        if (preset) {
+            const elevation = this.scopeBoxElevation();
+            const halfHeight = (preset.zMax - preset.zMin) / 2;
+            this.scopeBoxState = {
+                center: new THREE.Vector3(this.center.x, elevation + preset.zMin + halfHeight, this.center.z),
+                halfExtents: new THREE.Vector3(preset.halfX, halfHeight, preset.halfY),
+                quaternion: new THREE.Quaternion()
+            };
+            return;
+        }
+
+        const box = new THREE.Box3().setFromObject(this.root);
+        if (box.isEmpty()) {
+            box.setFromCenterAndSize(this.center, new THREE.Vector3(this.radius, this.radius, this.radius));
+        }
+        box.expandByScalar(Math.max(1, this.radius * 0.02));
+        this.scopeBoxState = {
+            center: box.getCenter(new THREE.Vector3()),
+            halfExtents: box.getSize(new THREE.Vector3()).multiplyScalar(0.5),
+            quaternion: new THREE.Quaternion()
+        };
+    }
+
+    // Cyan handle glyphs drawn on canvas (same idiom as the ViewCube face textures): a paired
+    // double arrow for the face push/pull handles (sprite rotation aligns it with the projected
+    // face normal) and a circular arrow for the rotate handle.
+    scopeBoxGlyphTexture(kind) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 96;
+        canvas.height = 96;
+
+        const context = canvas.getContext('2d');
+        context.fillStyle = '#00e0e0';
+        context.strokeStyle = '#00e0e0';
+
+        if (kind === 'arrow') {
+            context.beginPath();
+            context.moveTo(56, 32);
+            context.lineTo(56, 64);
+            context.lineTo(88, 48);
+            context.closePath();
+            context.fill();
+            context.beginPath();
+            context.moveTo(40, 32);
+            context.lineTo(40, 64);
+            context.lineTo(8, 48);
+            context.closePath();
+            context.fill();
+        } else {
+            context.lineWidth = 9;
+            context.beginPath();
+            context.arc(48, 48, 28, -Math.PI * 0.85, Math.PI * 0.55);
+            context.stroke();
+            const tipAngle = Math.PI * 0.55;
+            const tipX = 48 + 28 * Math.cos(tipAngle);
+            const tipY = 48 + 28 * Math.sin(tipAngle);
+            context.beginPath();
+            context.moveTo(tipX + 14, tipY + 2);
+            context.lineTo(tipX - 8, tipY + 12);
+            context.lineTo(tipX - 2, tipY - 12);
+            context.closePath();
+            context.fill();
+        }
+
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.colorSpace = THREE.SRGBColorSpace;
+        return texture;
+    }
+
+    // Lazily builds the two scope box groups on the first activation.
+    ensureScopeBoxGroup() {
+        if (this.scopeBoxGroup) {
+            return;
+        }
+
+        this.scopeBoxGroup = new THREE.Group();
+        this.scopeBoxGroup.visible = false;
+
+        const edgesGeometry = new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1));
+        this.scopeBoxWireframe = new THREE.LineSegments(edgesGeometry,
+            new THREE.LineBasicMaterial({ color: SCOPE_BOX_COLOR }));
+        this.scopeBoxWireframe.raycast = () => { };
+        this.scopeBoxGroup.add(this.scopeBoxWireframe);
+
+        // Faint depth-ignoring silhouette so the box outline reads through geometry.
+        this.scopeBoxSilhouette = new THREE.LineSegments(edgesGeometry,
+            new THREE.LineBasicMaterial({ color: SCOPE_BOX_COLOR, transparent: true, opacity: 0.25, depthTest: false }));
+        this.scopeBoxSilhouette.raycast = () => { };
+        this.scopeBoxSilhouette.renderOrder = 20;
+        this.scopeBoxGroup.add(this.scopeBoxSilhouette);
+
+        const arrowTexture = this.scopeBoxGlyphTexture('arrow');
+        for (let i = 0; i < SCOPE_BOX_FACES.length; i++) {
+            const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: arrowTexture, depthTest: false, transparent: true }));
+            sprite.renderOrder = 21;
+            sprite.visible = false;
+            this.scopeBoxGroup.add(sprite);
+            this.scopeBoxHandles.push(sprite);
+        }
+
+        this.scopeBoxRotateHandle = new THREE.Sprite(
+            new THREE.SpriteMaterial({ map: this.scopeBoxGlyphTexture('rotate'), depthTest: false, transparent: true }));
+        this.scopeBoxRotateHandle.renderOrder = 21;
+        this.scopeBoxRotateHandle.visible = false;
+        this.scopeBoxGroup.add(this.scopeBoxRotateHandle);
+
+        // Invisible raycast targets; Mesh.raycast ignores material visibility, so the proxies
+        // pick without ever rendering. Edges are always interactive (move/select); the face and
+        // rotate spheres only react while the gizmos are revealed.
+        const proxyMaterial = new THREE.MeshBasicMaterial({ visible: false });
+        for (let axis = 0; axis < 3; axis++) {
+            for (const signB of [-1, 1]) {
+                for (const signC of [-1, 1]) {
+                    const proxy = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), proxyMaterial);
+                    proxy.userData.scopeBoxPart = { type: 'edge', axis, signB, signC };
+                    this.scopeBoxGroup.add(proxy);
+                    this.scopeBoxProxies.push(proxy);
+                }
+            }
+        }
+        for (let i = 0; i < SCOPE_BOX_FACES.length; i++) {
+            const proxy = new THREE.Mesh(new THREE.SphereGeometry(0.75, 8, 8), proxyMaterial);
+            proxy.userData.scopeBoxPart = { type: 'face', face: i };
+            this.scopeBoxGroup.add(proxy);
+            this.scopeBoxProxies.push(proxy);
+        }
+        const rotateProxy = new THREE.Mesh(new THREE.SphereGeometry(0.75, 8, 8), proxyMaterial);
+        rotateProxy.userData.scopeBoxPart = { type: 'rotate' };
+        this.scopeBoxGroup.add(rotateProxy);
+        this.scopeBoxProxies.push(rotateProxy);
+
+        this.scene.add(this.scopeBoxGroup);
+    }
+
+    // Local position of the rotate handle: floating just outside the +X top edge of the box, so
+    // it rotates with the box and stays reachable from above.
+    scopeBoxRotateHandlePosition() {
+        const halfExtents = this.scopeBoxState.halfExtents;
+        return new THREE.Vector3(halfExtents.x * 1.15, halfExtents.y, 0);
+    }
+
+    // Re-derives every visual from the box state: group transform, wireframe scale, handle and
+    // proxy placements, then the clipping planes.
+    updateScopeBoxVisuals() {
+        if (!this.scopeBoxGroup || !this.scopeBoxState) {
+            return;
+        }
+
+        const { center, halfExtents, quaternion } = this.scopeBoxState;
+        const extents = [halfExtents.x, halfExtents.y, halfExtents.z];
+
+        this.scopeBoxGroup.position.copy(center);
+        this.scopeBoxGroup.quaternion.copy(quaternion);
+
+        this.scopeBoxWireframe.scale.set(extents[0] * 2, extents[1] * 2, extents[2] * 2);
+        this.scopeBoxSilhouette.scale.copy(this.scopeBoxWireframe.scale);
+
+        const thickness = Math.max(0.05, 2 * halfExtents.length() * SCOPE_BOX_EDGE_PICK_RATIO);
+        for (const proxy of this.scopeBoxProxies) {
+            const part = proxy.userData.scopeBoxPart;
+            if (part.type === 'edge') {
+                const axisB = (part.axis + 1) % 3;
+                const axisC = (part.axis + 2) % 3;
+                const position = [0, 0, 0];
+                position[axisB] = part.signB * extents[axisB];
+                position[axisC] = part.signC * extents[axisC];
+                proxy.position.set(...position);
+                const scale = [0, 0, 0];
+                scale[part.axis] = extents[part.axis] * 2 + thickness;
+                scale[axisB] = thickness;
+                scale[axisC] = thickness;
+                proxy.scale.set(...scale);
+            } else if (part.type === 'face') {
+                const [axis, sign] = SCOPE_BOX_FACES[part.face];
+                const position = [0, 0, 0];
+                position[axis] = sign * extents[axis];
+                proxy.position.set(...position);
+            } else {
+                proxy.position.copy(this.scopeBoxRotateHandlePosition());
+            }
+        }
+
+        for (let i = 0; i < this.scopeBoxHandles.length; i++) {
+            const [axis, sign] = SCOPE_BOX_FACES[i];
+            const position = [0, 0, 0];
+            position[axis] = sign * extents[axis];
+            this.scopeBoxHandles[i].position.set(...position);
+        }
+        this.scopeBoxRotateHandle.position.copy(this.scopeBoxRotateHandlePosition());
+
+        this.updateScopeBoxPlanes();
+    }
+
+    // Recomputes the six world-space clipping planes from the box state, mutating the shared
+    // Plane instances in place. three.js keeps fragments on the positive side of every plane,
+    // so the normals point inward.
+    updateScopeBoxPlanes() {
+        const { center, halfExtents, quaternion } = this.scopeBoxState;
+        const extents = [halfExtents.x, halfExtents.y, halfExtents.z];
+
+        for (let i = 0; i < SCOPE_BOX_FACES.length; i++) {
+            const [axis, sign] = SCOPE_BOX_FACES[i];
+            const outward = new THREE.Vector3().setComponent(axis, sign).applyQuaternion(quaternion);
+            const faceCenter = center.clone().addScaledVector(outward, extents[axis]);
+            this.scopeBoxPlanes[i].setFromNormalAndCoplanarPoint(outward.negate(), faceCenter);
+        }
+    }
+
+    forEachModelMaterial(callback) {
+        this.root?.traverse((object) => {
+            const material = object.material;
+            if (!material) {
+                return;
+            }
+            for (const item of Array.isArray(material) ? material : [material]) {
+                callback(item);
+            }
+        });
+    }
+
+    // Assigns (or clears) the shared clipping planes on every model material - batched meshes,
+    // legacy cloned materials and the edge overlay lines (mesh children) alike. Ground, grid,
+    // ViewCube and the scope box visuals live outside this.root and are never clipped.
+    applyScopeBoxClipping() {
+        if (!this.root) {
+            return;
+        }
+
+        const planes = this.environmentState.scopeBoxEnabled && this.scopeBoxState !== null ? this.scopeBoxPlanes : null;
+        this.forEachModelMaterial((material) => {
+            if (material.clippingPlanes === planes) {
+                return;
+            }
+            material.clippingPlanes = planes;
+            material.clipShadows = planes !== null;
+            // The clipping plane count is part of the shader program key.
+            material.needsUpdate = true;
+        });
+    }
+
+    // Box containment with a small tolerance, in box-local coordinates.
+    scopeBoxContains(worldPoint) {
+        const { center, halfExtents, quaternion } = this.scopeBoxState;
+        const local = worldPoint.clone().sub(center).applyQuaternion(quaternion.clone().invert());
+        const epsilon = 1e-4;
+        return Math.abs(local.x) <= halfExtents.x + epsilon
+            && Math.abs(local.y) <= halfExtents.y + epsilon
+            && Math.abs(local.z) <= halfExtents.z + epsilon;
+    }
+
+    setScopeBoxSelected(selected) {
+        this.scopeBoxSelected = !!selected;
+        for (const handle of this.scopeBoxHandles) {
+            handle.visible = this.scopeBoxSelected;
+        }
+        if (this.scopeBoxRotateHandle) {
+            this.scopeBoxRotateHandle.visible = this.scopeBoxSelected;
+        }
+    }
+
+    // Raycasts the invisible proxies. Face/rotate parts only react while the gizmos are
+    // revealed; edges are always interactive.
+    pickScopeBoxPart(event) {
+        this.updatePointer(event);
+        this.scopeBoxRaycaster.setFromCamera(this.pointer, this.camera);
+        const intersections = this.scopeBoxRaycaster.intersectObjects(this.scopeBoxProxies, false);
+        for (const intersection of intersections) {
+            const part = intersection.object.userData.scopeBoxPart;
+            if (part.type === 'edge' || this.scopeBoxSelected) {
+                return { part, point: intersection.point.clone() };
+            }
+        }
+        return null;
+    }
+
+    // Intersection of the pointer ray with a plane, or null when parallel.
+    scopeBoxRayPlanePoint(event, plane) {
+        this.updatePointer(event);
+        this.scopeBoxRaycaster.setFromCamera(this.pointer, this.camera);
+        const point = new THREE.Vector3();
+        return this.scopeBoxRaycaster.ray.intersectPlane(plane, point) ? point : null;
+    }
+
+    // Parameter t of the point on the line origin + direction * t closest to the pointer ray
+    // (closest-point-between-lines with both directions normalized), or null when parallel.
+    scopeBoxAxisParameter(event, origin, direction) {
+        this.updatePointer(event);
+        this.scopeBoxRaycaster.setFromCamera(this.pointer, this.camera);
+        const ray = this.scopeBoxRaycaster.ray;
+
+        const w = origin.clone().sub(ray.origin);
+        const b = direction.dot(ray.direction);
+        const d = direction.dot(w);
+        const e = ray.direction.dot(w);
+        const denominator = 1 - b * b;
+        return Math.abs(denominator) < 1e-8 ? null : (b * e - d) / denominator;
+    }
+
+    startScopeBoxDrag(hit, event) {
+        const dom = this.renderer.domElement;
+        try {
+            dom.setPointerCapture(event.pointerId);
+        } catch {
+            // Ignored: pointer capture is an enhancement, not a requirement.
+        }
+        this.controls.enabled = false;
+
+        const { center, halfExtents, quaternion } = this.scopeBoxState;
+        const drag = {
+            part: hit.part,
+            start: this.containerPosition(event),
+            moved: false,
+            grabPoint: hit.point,
+            startCenter: center.clone(),
+            startHalfExtents: halfExtents.clone(),
+            startQuaternion: quaternion.clone()
+        };
+
+        if (hit.part.type === 'edge') {
+            // Translation: the box follows the pointer on a camera-facing plane through the
+            // grab point, giving full 3D movement that tracks the cursor.
+            const normal = this.camera.getWorldDirection(new THREE.Vector3());
+            drag.plane = new THREE.Plane().setFromNormalAndCoplanarPoint(normal, hit.point);
+        } else if (hit.part.type === 'face') {
+            const [axis, sign] = SCOPE_BOX_FACES[hit.part.face];
+            drag.axis = axis;
+            drag.outward = new THREE.Vector3().setComponent(axis, sign).applyQuaternion(quaternion);
+            drag.origin = hit.point.clone();
+            drag.startT = this.scopeBoxAxisParameter(event, drag.origin, drag.outward) ?? 0;
+        } else {
+            // Rotation on the horizontal plane through the box center.
+            drag.plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -center.y);
+            const point = this.scopeBoxRayPlanePoint(event, drag.plane) ?? hit.point;
+            drag.startAngle = Math.atan2(point.z - center.z, point.x - center.x);
+        }
+
+        this.scopeBoxDrag = drag;
+    }
+
+    updateScopeBoxDrag(event) {
+        const drag = this.scopeBoxDrag;
+        const state = this.scopeBoxState;
+
+        const position = this.containerPosition(event);
+        if (Math.hypot(position.x - drag.start.x, position.y - drag.start.y) > MARQUEE_THRESHOLD) {
+            drag.moved = true;
+        }
+
+        if (drag.part.type === 'edge') {
+            const point = this.scopeBoxRayPlanePoint(event, drag.plane);
+            if (point) {
+                state.center.copy(drag.startCenter).add(point.sub(drag.grabPoint));
+            }
+        } else if (drag.part.type === 'face') {
+            const t = this.scopeBoxAxisParameter(event, drag.origin, drag.outward);
+            if (t !== null) {
+                const startHalf = drag.startHalfExtents.getComponent(drag.axis);
+                const half = Math.max(SCOPE_BOX_MIN_SIZE / 2, startHalf + (t - drag.startT) / 2);
+                state.halfExtents.setComponent(drag.axis, half);
+                // The opposite face stays fixed: the center follows the dragged face by half
+                // the growth.
+                state.center.copy(drag.startCenter).addScaledVector(drag.outward, half - startHalf);
+            }
+        } else {
+            const point = this.scopeBoxRayPlanePoint(event, drag.plane);
+            if (point) {
+                // atan2(z, x) angles shrink under a positive Y rotation, hence startAngle - angle.
+                const angle = Math.atan2(point.z - drag.startCenter.z, point.x - drag.startCenter.x);
+                const rotation = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), drag.startAngle - angle);
+                state.quaternion.copy(rotation.multiply(drag.startQuaternion));
+            }
+        }
+
+        this.updateScopeBoxVisuals();
+    }
+
+    endScopeBoxDrag(event) {
+        const dom = this.renderer.domElement;
+        try {
+            dom.releasePointerCapture(event.pointerId);
+        } catch {
+            // Ignored: the pointer may not have been captured.
+        }
+        this.controls.enabled = true;
+
+        const drag = this.scopeBoxDrag;
+        this.scopeBoxDrag = null;
+
+        // A press without movement on an edge is a click: toggle the face/rotate gizmos.
+        if (!drag.moved && drag.part.type === 'edge') {
+            this.setScopeBoxSelected(!this.scopeBoxSelected);
+        }
+
+        this.dispatchScopeBoxChanged();
+    }
+
+    // Per-frame upkeep: constant screen-size handles (and matching pick spheres) plus the
+    // screen-space orientation of the face push/pull arrows.
+    updateScopeBoxFrame() {
+        if (!this.scopeBoxInteractive()) {
+            return;
+        }
+
+        const fovScale = Math.tan(THREE.MathUtils.degToRad(this.camera.fov / 2)) * SCOPE_BOX_HANDLE_SIZE * 2;
+        const worldPosition = new THREE.Vector3();
+
+        for (const sprite of [...this.scopeBoxHandles, this.scopeBoxRotateHandle]) {
+            sprite.getWorldPosition(worldPosition);
+            const size = worldPosition.distanceTo(this.camera.position) * fovScale;
+            sprite.scale.set(size, size, 1);
+        }
+
+        for (const proxy of this.scopeBoxProxies) {
+            const type = proxy.userData.scopeBoxPart.type;
+            if (type === 'face' || type === 'rotate') {
+                proxy.getWorldPosition(worldPosition);
+                const size = worldPosition.distanceTo(this.camera.position) * fovScale;
+                proxy.scale.set(size, size, size);
+            }
+        }
+
+        if (!this.scopeBoxSelected) {
+            return;
+        }
+
+        const { quaternion } = this.scopeBoxState;
+        for (let i = 0; i < this.scopeBoxHandles.length; i++) {
+            const sprite = this.scopeBoxHandles[i];
+            const [axis, sign] = SCOPE_BOX_FACES[i];
+            const outward = new THREE.Vector3().setComponent(axis, sign).applyQuaternion(quaternion);
+
+            sprite.getWorldPosition(worldPosition);
+            const projectedBase = worldPosition.clone().project(this.camera);
+            const projectedTip = worldPosition.clone().add(outward).project(this.camera);
+            const dx = (projectedTip.x - projectedBase.x) * this.aspect();
+            const dy = projectedTip.y - projectedBase.y;
+            if (dx * dx + dy * dy > 1e-12) {
+                sprite.material.rotation = Math.atan2(dy, dx);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------------------------------
     // Settings panel with the environment controls (gizmo/ground visibility, fog, view range).
     // When the host page provides an element with id 'gltf-settings' (typically inside its own
     // left side panel card), the controls mount there and inherit the host theme. Without one,
@@ -1989,6 +2658,23 @@ export class GltfViewer {
             this.statusTerminal?.setVisible(checked);
         });
 
+        // Scope box rows: the visibility toggle only applies while the box is enabled, so it is
+        // disabled and grayed whenever the primary checkbox is unchecked.
+        let scopeBoxVisibleInput = null;
+        const syncScopeBoxVisibleRow = () => {
+            const enabled = this.environmentState.scopeBoxEnabled;
+            scopeBoxVisibleInput.disabled = !enabled;
+            scopeBoxVisibleInput.parentElement.style.opacity = enabled ? '1' : '0.45';
+            scopeBoxVisibleInput.parentElement.style.cursor = enabled ? 'pointer' : 'default';
+        };
+        checkboxRow('Scope Box', this.environmentState.scopeBoxEnabled, (checked) => {
+            this.setScopeBoxEnabled(checked);
+            syncScopeBoxVisibleRow();
+        });
+        scopeBoxVisibleInput = checkboxRow('Scope Box visible', this.environmentState.scopeBoxVisible,
+            (checked) => this.setScopeBoxVisible(checked));
+        syncScopeBoxVisibleRow();
+
         const fogWrapper = sliderLabel('Fog');
         const fogInput = document.createElement('input');
         fogInput.type = 'range';
@@ -2054,6 +2740,7 @@ export class GltfViewer {
         this.renderer.setAnimationLoop(() => {
             this.updateViewCubeAnimation();
             this.controls.update();
+            this.updateScopeBoxFrame();
             this.renderer.render(this.scene, this.camera);
             this.updateViewCube();
         });
