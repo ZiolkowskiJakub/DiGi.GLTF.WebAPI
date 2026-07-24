@@ -6,6 +6,8 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using System.Collections.Generic;
 using System.Text.Json.Nodes;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace DiGi.GLTF.WebAPI.Classes
 {
@@ -22,15 +24,18 @@ namespace DiGi.GLTF.WebAPI.Classes
         /// </summary>
         /// <param name="jsonArray">The JSON array with serialized <see cref="GLTFNode"/> instances or raw DiGi geometry objects.</param>
         /// <param name="name">The optional display name of the scene.</param>
-        /// <returns>An <see cref="IActionResult"/> holding the <see cref="GLTFScene"/> JSON.</returns>
-        [HttpPost("fromobjects", Name = $"{nameof(GLTFSceneController)}_{nameof(FromObjects)}")]
+        /// <param name="cancellationToken">A cancellation token that can be used by the caller to cancel the asynchronous operation.</param>
+        /// <returns>A <see cref="Task{IActionResult}"/> holding the <see cref="GLTFScene"/> JSON.</returns>
+        [HttpPost("fromobjects", Name = $"{nameof(GLTFSceneController)}_{nameof(FromObjectsAsync)}")]
         [ApiExplorerSettings(IgnoreApi = false)]
         [ProducesResponseType(typeof(GLTFScene), StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status204NoContent)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
-        public IActionResult FromObjects([FromBody] JsonArray? jsonArray, [FromQuery(Name = "name")] string? name = null)
+        public async Task<IActionResult> FromObjectsAsync([FromBody] JsonArray? jsonArray, [FromQuery(Name = "name")] string? name = null, CancellationToken cancellationToken = default)
         {
-            Serilog.Modify.Log("{Type}:{Name} started", nameof(GLTFSceneController), nameof(FromObjects));
+            Serilog.Modify.Log("{Type}:{Name} started", nameof(GLTFSceneController), nameof(FromObjectsAsync));
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             if (jsonArray is null)
             {
@@ -43,11 +48,15 @@ namespace DiGi.GLTF.WebAPI.Classes
                 return NoContent();
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
+
             GLTFScene? gLTFScene = Create.GLTFScene(serializableObjects, name);
             if (gLTFScene is null)
             {
                 return NoContent();
             }
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             string? json = gLTFScene.ToSystem_String();
             if (string.IsNullOrWhiteSpace(json))
@@ -62,16 +71,19 @@ namespace DiGi.GLTF.WebAPI.Classes
         /// Converts the provided <see cref="GLTFScene"/> JSON into a binary glTF (.glb) file.
         /// </summary>
         /// <param name="jsonObject">The JSON object with the serialized <see cref="GLTFScene"/>.</param>
-        /// <returns>An <see cref="IActionResult"/> holding the .glb file.</returns>
-        [HttpPost("glb", Name = $"{nameof(GLTFSceneController)}_{nameof(GLB)}")]
+        /// <param name="cancellationToken">A cancellation token that can be used by the caller to cancel the asynchronous operation.</param>
+        /// <returns>A <see cref="Task{IActionResult}"/> holding the .glb file.</returns>
+        [HttpPost("glb", Name = $"{nameof(GLTFSceneController)}_{nameof(GLBAsync)}")]
         [ApiExplorerSettings(IgnoreApi = false)]
         [Produces("model/gltf-binary")]
         [ProducesResponseType(typeof(FileContentResult), StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status204NoContent)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
-        public IActionResult GLB([FromBody] JsonObject? jsonObject)
+        public async Task<IActionResult> GLBAsync([FromBody] JsonObject? jsonObject, CancellationToken cancellationToken = default)
         {
-            Serilog.Modify.Log("{Type}:{Name} started", nameof(GLTFSceneController), nameof(GLB));
+            Serilog.Modify.Log("{Type}:{Name} started", nameof(GLTFSceneController), nameof(GLBAsync));
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             if (jsonObject is null)
             {
@@ -83,6 +95,8 @@ namespace DiGi.GLTF.WebAPI.Classes
             {
                 return BadRequest();
             }
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             byte[]? bytes = gLTFScene.ToSystem_Bytes();
             if (bytes is null || bytes.Length == 0)
