@@ -65,6 +65,7 @@ namespace DiGi.GLTF.WebAPI.Classes
         /// <returns>An <see cref="IActionResult"/> holding the .glb file.</returns>
         [HttpPost("glb", Name = $"{nameof(GLTFSceneController)}_{nameof(GLB)}")]
         [ApiExplorerSettings(IgnoreApi = false)]
+        [Produces("model/gltf-binary")]
         [ProducesResponseType(typeof(FileContentResult), StatusCodes.Status200OK)]
         [ProducesResponseType(StatusCodes.Status204NoContent)]
         [ProducesResponseType(StatusCodes.Status400BadRequest)]
