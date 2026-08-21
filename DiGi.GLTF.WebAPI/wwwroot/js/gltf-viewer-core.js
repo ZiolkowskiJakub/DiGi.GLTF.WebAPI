@@ -491,8 +491,9 @@ export class GltfViewer {
         this.bvh = null;
 
         // Environment settings driven by the built-in Settings panel (and the public setters).
-        this.environmentState = { gizmoVisible: true, groundVisible: true, terminalVisible: true, fog: FOG_DEFAULT, viewRange: VIEW_RANGE_DEFAULT, scopeBoxEnabled: false, scopeBoxVisible: true };
+        this.environmentState = { gizmoVisible: true, terrainVisible: true, groundVisible: true, terminalVisible: true, fog: FOG_DEFAULT, viewRange: VIEW_RANGE_DEFAULT, scopeBoxEnabled: false, scopeBoxVisible: true };
         this.groundGroup = null;
+        this.hasTerrain = false;
 
         // Scope box: the six shared clipping planes are created once and mutated in place, so
         // every clipped material follows box drags without per-material updates. The box state
@@ -776,7 +777,7 @@ export class GltfViewer {
 
             this.container.dispatchEvent(new CustomEvent('gltf-ready', {
                 detail: {
-                    objectCount: this.objects.length,
+                    objectCount: this.objects.filter((o) => !o.isTerrain).length,
                     referencePoint: this.sceneData.ReferencePoint ?? null,
                     name: this.sceneData.Name ?? null
                 }
@@ -817,6 +818,7 @@ export class GltfViewer {
             }
 
             for (const entry of objectMap) {
+                const isTerrain = entry.name === 'Terrain';
                 this.objects.push({
                     reference: entry.reference ?? '',
                     name: entry.name ?? '',
@@ -824,12 +826,14 @@ export class GltfViewer {
                     mesh: this.batchMeshes[entry.batchIndex] ?? null,
                     vertexStart: entry.vertexStart ?? 0,
                     vertexCount: entry.vertexCount ?? 0,
+                    isTerrain: isTerrain,
                     // Culling metadata, filled by buildCullingData in the deferred pass.
                     center: null,
                     indexStart: 0,
                     indexCount: 0
                 });
             }
+            this.hasTerrain = this.objects.some((o) => o.isTerrain);
             return;
         }
 
@@ -846,6 +850,7 @@ export class GltfViewer {
                 userData = mesh.parent.userData;
             }
 
+            const isTerrain = mesh.name === 'Terrain';
             this.meshObjects.set(mesh, this.objects.length);
             this.objects.push({
                 reference: mesh.name || '',
@@ -854,11 +859,13 @@ export class GltfViewer {
                 mesh: mesh,
                 vertexStart: 0,
                 vertexCount: mesh.geometry.getAttribute('position')?.count ?? 0,
+                isTerrain: isTerrain,
                 center: null,
                 indexStart: 0,
                 indexCount: 0
             });
         }
+        this.hasTerrain = this.objects.some((o) => o.isTerrain);
     }
 
     // Deferred heavy work after the first presented frame: culling metadata, the initial view
@@ -950,7 +957,12 @@ export class GltfViewer {
         const range = this.environmentState.viewRange;
         const hidden = new Set();
         for (let id = 0; id < this.objects.length; id++) {
-            const center = this.objects[id].center;
+            const object = this.objects[id];
+            if (object.isTerrain && !this.environmentState.terrainVisible) {
+                hidden.add(id);
+                continue;
+            }
+            const center = object.center;
             if (center && Math.hypot(center.x - this.center.x, center.z - this.center.z) > range) {
                 hidden.add(id);
             }
@@ -1097,13 +1109,13 @@ export class GltfViewer {
     // Ground group at the DiGi world elevation Z = 0: a visible ground plate, the line grid and a
     // transparent shadow catcher. The scene is translated by the reference point and rotated to
     // Y-up, so world Z = 0 sits at three.js y = -ReferencePoint.Z. Everything lives in one group
-    // toggled by the "Show ground" setting; none of it is pickable (only this.root meshes are).
+    // toggled by the "Show terrain" setting; suppressed when a 3D terrain mesh is present in the scene.
     addGroundAndGrid() {
         const size = this.radius * 8;
         const elevation = -(this.sceneData.ReferencePoint?.Z ?? 0);
 
         this.groundGroup = new THREE.Group();
-        this.groundGroup.visible = this.environmentState.groundVisible;
+        this.groundGroup.visible = !this.hasTerrain && this.environmentState.terrainVisible;
 
         const ground = new THREE.Mesh(
             new THREE.PlaneGeometry(size, size),
@@ -1234,11 +1246,17 @@ export class GltfViewer {
         }
     }
 
-    setGroundVisible(visible) {
+    setTerrainVisible(visible) {
+        this.environmentState.terrainVisible = !!visible;
         this.environmentState.groundVisible = !!visible;
         if (this.groundGroup) {
-            this.groundGroup.visible = this.environmentState.groundVisible;
+            this.groundGroup.visible = !this.hasTerrain && this.environmentState.terrainVisible;
         }
+        this.applyCulling();
+    }
+
+    setGroundVisible(visible) {
+        this.setTerrainVisible(visible);
     }
 
     // Normalized fog control: 0 disables the fog, 1 places the fully fogged distance at the
@@ -1550,7 +1568,7 @@ export class GltfViewer {
 
         const screenBounds = new Array(this.objects.length).fill(null);
         for (let id = 0; id < this.objects.length; id++) {
-            if (this.hiddenIds.has(id)) {
+            if (this.hiddenIds.has(id) || this.objects[id].isTerrain) {
                 continue;
             }
             const object = this.objects[id];
@@ -1631,7 +1649,7 @@ export class GltfViewer {
                 const id = this.meshObjects.get(intersection.object);
                 // The raycaster does not honor mesh visibility, so view-range hidden objects are
                 // filtered here.
-                return id === undefined || this.hiddenIds.has(id) ? null : id;
+                return id === undefined || this.hiddenIds.has(id) || this.objects[id]?.isTerrain ? null : id;
             }
 
             const idAttribute = objectIdAttributeOf(intersection.object.geometry);
@@ -1642,7 +1660,7 @@ export class GltfViewer {
             // Culled triangles are absent from the rebuilt index, but a stale BVH can still report
             // them between an index rebuild and the debounced BVH rebuild.
             const id = Math.round(idAttribute.getX(intersection.face.a));
-            return this.hiddenIds.has(id) ? null : id;
+            return this.hiddenIds.has(id) || this.objects[id]?.isTerrain ? null : id;
         }
 
         return null;
@@ -2039,10 +2057,10 @@ export class GltfViewer {
             && this.scopeBoxGroup !== null && this.scopeBoxGroup.visible;
     }
 
-    // Ground elevation convention shared with addGroundAndGrid: DiGi world Z = 0 sits at
-    // three.js y = -ReferencePoint.Z.
+    // In local scene coordinates, world elevations Z are preserved relative to ReferencePoint.Z,
+    // so y = 0 corresponds directly to the scene datum.
     scopeBoxElevation() {
-        return -(this.sceneData.ReferencePoint?.Z ?? 0);
+        return 0;
     }
 
     setScopeBoxEnabled(enabled) {
@@ -2089,7 +2107,7 @@ export class GltfViewer {
     }
 
     // Reports the box in DiGi Z-up coordinates: three.js world (x, y, z) -> DiGi
-    // (x, -z, y - elevation); the rotation about the vertical axis carries over sign-identically.
+    // (x, -z, y); the rotation about the vertical axis carries over sign-identically.
     getScopeBoxState() {
         const { scopeBoxEnabled, scopeBoxVisible } = this.environmentState;
         if (!this.scopeBoxState) {
@@ -2097,11 +2115,10 @@ export class GltfViewer {
         }
 
         const { center, halfExtents, quaternion } = this.scopeBoxState;
-        const elevation = this.scopeBoxElevation();
         return {
             enabled: scopeBoxEnabled,
             visible: scopeBoxVisible,
-            center: { X: center.x, Y: -center.z, Z: center.y - elevation },
+            center: { X: center.x, Y: -center.z, Z: center.y },
             size: { X: halfExtents.x * 2, Y: halfExtents.z * 2, Z: halfExtents.y * 2 },
             rotation: THREE.MathUtils.radToDeg(2 * Math.atan2(quaternion.y, quaternion.w))
         };
@@ -2122,15 +2139,14 @@ export class GltfViewer {
     }
 
     // First-activation default: the per-view preset centered on the scene (DiGi X half extent ->
-    // three x, DiGi Y -> three z, DiGi Z range -> three y above the ground elevation), or a
+    // three x, DiGi Y -> three z, DiGi Z range -> three y above the local datum), or a
     // bounds fit of the loaded model with a small margin.
     initializeScopeBoxDefaults() {
         const preset = this.parseScopeBoxPreset(this.container.dataset.scopeBoxSize);
         if (preset) {
-            const elevation = this.scopeBoxElevation();
             const halfHeight = (preset.zMax - preset.zMin) / 2;
             this.scopeBoxState = {
-                center: new THREE.Vector3(this.center.x, elevation + preset.zMin + halfHeight, this.center.z),
+                center: new THREE.Vector3(this.center.x, preset.zMin + halfHeight, this.center.z),
                 halfExtents: new THREE.Vector3(preset.halfX, halfHeight, preset.halfY),
                 quaternion: new THREE.Quaternion()
             };
@@ -2651,8 +2667,15 @@ export class GltfViewer {
             return wrapper;
         };
 
+        const terrainLocked = this.container.dataset.terrainLocked === 'true';
         checkboxRow('Show gizmo', this.environmentState.gizmoVisible, (checked) => this.setGizmoVisible(checked));
-        checkboxRow('Show ground', this.environmentState.groundVisible, (checked) => this.setGroundVisible(checked));
+        const terrainCheckbox = checkboxRow('Show terrain', this.environmentState.terrainVisible, (checked) => this.setTerrainVisible(checked));
+        if (terrainLocked && terrainCheckbox) {
+            terrainCheckbox.disabled = true;
+            terrainCheckbox.parentElement.style.opacity = '0.6';
+            terrainCheckbox.parentElement.style.cursor = 'not-allowed';
+            terrainCheckbox.parentElement.title = 'Terrain is locked for this view';
+        }
         checkboxRow('Show terminal', this.environmentState.terminalVisible, (checked) => {
             this.environmentState.terminalVisible = checked;
             this.statusTerminal?.setVisible(checked);
