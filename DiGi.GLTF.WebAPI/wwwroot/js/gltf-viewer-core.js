@@ -1060,8 +1060,8 @@ export class GltfViewer {
         this.buildEdgeOverlays(pickables);
     }
 
-    // Edge overlays for visual quality, skipped for extreme triangle counts. Existing overlays
-    // are disposed first so the edges always match the current index buffers.
+    // Edge overlays for visual quality, skipped for extreme triangle counts and terrain surfaces.
+    // Existing overlays are disposed first so the edges always match the current index buffers.
     buildEdgeOverlays(meshes) {
         for (const [mesh, edges] of this.edgeOverlays) {
             mesh.remove(edges);
@@ -1072,8 +1072,28 @@ export class GltfViewer {
 
         let totalTriangles = 0;
         for (const mesh of meshes) {
-            if (mesh?.geometry?.index) {
-                totalTriangles += mesh.geometry.index.count / 3;
+            if (this.batched) {
+                const ids = this.meshObjectIds.get(mesh);
+                if (ids) {
+                    for (const id of ids) {
+                        if (!this.hiddenIds.has(id) && !this.objects[id]?.isTerrain) {
+                            totalTriangles += this.objects[id].indexCount / 3;
+                        }
+                    }
+                } else if (mesh?.geometry?.index) {
+                    totalTriangles += mesh.geometry.index.count / 3;
+                }
+            } else {
+                const id = this.meshObjects.get(mesh);
+                if (id !== undefined && this.objects[id]?.isTerrain) {
+                    continue;
+                }
+                if (mesh?.name === 'Terrain') {
+                    continue;
+                }
+                if (mesh?.geometry?.index) {
+                    totalTriangles += mesh.geometry.index.count / 3;
+                }
             }
         }
         if (totalTriangles > EDGES_TRIANGLE_LIMIT) {
@@ -1084,12 +1104,63 @@ export class GltfViewer {
             if (!mesh?.geometry) {
                 continue;
             }
+
+            let geometryForEdges = mesh.geometry;
+            let tempGeometry = null;
+
+            if (this.batched) {
+                const ids = this.meshObjectIds.get(mesh);
+                const hasTerrain = ids && ids.some((id) => this.objects[id]?.isTerrain);
+                if (hasTerrain) {
+                    const original = this.originalIndices.get(mesh);
+                    if (original) {
+                        let count = 0;
+                        for (const id of ids) {
+                            if (!this.hiddenIds.has(id) && !this.objects[id]?.isTerrain) {
+                                count += this.objects[id].indexCount;
+                            }
+                        }
+                        if (count === 0) {
+                            continue;
+                        }
+
+                        const filtered = new original.constructor(count);
+                        let offset = 0;
+                        for (const id of ids) {
+                            if (this.hiddenIds.has(id) || this.objects[id]?.isTerrain) {
+                                continue;
+                            }
+                            const object = this.objects[id];
+                            filtered.set(original.subarray(object.indexStart, object.indexStart + object.indexCount), offset);
+                            offset += object.indexCount;
+                        }
+
+                        tempGeometry = new THREE.BufferGeometry();
+                        tempGeometry.setAttribute('position', mesh.geometry.getAttribute('position'));
+                        tempGeometry.setIndex(new THREE.BufferAttribute(filtered, 1));
+                        geometryForEdges = tempGeometry;
+                    }
+                }
+            } else {
+                const id = this.meshObjects.get(mesh);
+                if (id !== undefined && this.objects[id]?.isTerrain) {
+                    continue;
+                }
+                if (mesh.name === 'Terrain') {
+                    continue;
+                }
+            }
+
             const edges = new THREE.LineSegments(
-                new THREE.EdgesGeometry(mesh.geometry, 25),
+                new THREE.EdgesGeometry(geometryForEdges, 25),
                 new THREE.LineBasicMaterial({ color: 0x11141b, transparent: true, opacity: 0.55 }));
             edges.raycast = () => { };
             mesh.add(edges);
             this.edgeOverlays.set(mesh, edges);
+
+            if (tempGeometry) {
+                tempGeometry.dispose();
+            }
         }
 
         // Overlays are rebuilt after view-range changes; the fresh line materials must pick up
