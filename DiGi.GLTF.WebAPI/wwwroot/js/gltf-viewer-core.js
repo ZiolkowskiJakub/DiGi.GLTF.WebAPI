@@ -213,6 +213,191 @@ function objectIdAttributeOf(geometry) {
     return geometry.getAttribute('_objectid') ?? geometry.getAttribute('_OBJECTID') ?? null;
 }
 
+// Extracts boundary edge line-segment indices for internal holes (e.g. building cutouts) in a terrain mesh.
+// Triangles in terrain have boundary edges (count === 1). The loop with the largest 2D horizontal area (X-Z plane)
+// represents the outer terrain perimeter. Internal loops are filtered against building bounding boxes to ensure
+// only actual building cutout holes receive edge overlays, discarding stray terrain triangulation gaps / DTM defects.
+function extractTerrainHoleIndices(positionAttribute, indexArray, indexStart = 0, indexCount = indexArray?.length ?? 0, buildingBoxes = null) {
+    if (!positionAttribute || !indexArray || indexCount < 3) {
+        return null;
+    }
+
+    // 1. Count occurrences of undirected edges across the specified index range
+    const edgeMap = new Map();
+    const end = indexStart + indexCount;
+    for (let i = indexStart; i < end; i += 3) {
+        const a = indexArray[i];
+        const b = indexArray[i + 1];
+        const c = indexArray[i + 2];
+
+        const triEdges = [
+            [a, b],
+            [b, c],
+            [c, a]
+        ];
+
+        for (let j = 0; j < 3; j++) {
+            const u = triEdges[j][0];
+            const v = triEdges[j][1];
+            const min = u < v ? u : v;
+            const max = u < v ? v : u;
+            const key = `${min}_${max}`;
+            const existing = edgeMap.get(key);
+            if (existing) {
+                existing.count++;
+            } else {
+                edgeMap.set(key, { u: min, v: max, count: 1 });
+            }
+        }
+    }
+
+    // 2. Filter boundary edges (count === 1)
+    const boundaryEdges = [];
+    for (const entry of edgeMap.values()) {
+        if (entry.count === 1) {
+            boundaryEdges.push(entry);
+        }
+    }
+
+    if (boundaryEdges.length < 3) {
+        return null;
+    }
+
+    // 3. Build adjacency graph: vertex -> [adjacent vertices]
+    const adjacency = new Map();
+    for (const { u, v } of boundaryEdges) {
+        if (!adjacency.has(u)) adjacency.set(u, []);
+        if (!adjacency.has(v)) adjacency.set(v, []);
+        adjacency.get(u).push(v);
+        adjacency.get(v).push(u);
+    }
+
+    // 4. Form closed loops
+    const visitedEdges = new Set();
+    const loops = [];
+
+    for (const { u, v } of boundaryEdges) {
+        const edgeKey = `${u}_${v}`;
+        if (visitedEdges.has(edgeKey)) {
+            continue;
+        }
+
+        const loop = [u];
+        let curr = v;
+        visitedEdges.add(edgeKey);
+
+        while (curr !== u) {
+            loop.push(curr);
+            const neighbors = adjacency.get(curr);
+            let next = null;
+            if (neighbors) {
+                for (const n of neighbors) {
+                    const nextKey = `${Math.min(curr, n)}_${Math.max(curr, n)}`;
+                    if (!visitedEdges.has(nextKey)) {
+                        next = n;
+                        visitedEdges.add(nextKey);
+                        break;
+                    }
+                }
+            }
+            if (next === null) {
+                break;
+            }
+            curr = next;
+        }
+
+        if (loop.length >= 3) {
+            loops.push(loop);
+        }
+    }
+
+    if (loops.length <= 1) {
+        return null;
+    }
+
+    // 5. Compute 2D horizontal plane area (using X and Y plan coordinates) via shoelace formula
+    const loopInfos = [];
+    for (const loop of loops) {
+        let area2D = 0;
+        const n = loop.length;
+        for (let i = 0; i < n; i++) {
+            const idx1 = loop[i];
+            const idx2 = loop[(i + 1) % n];
+            const x1 = positionAttribute.getX(idx1);
+            const y1 = positionAttribute.getY(idx1);
+            const x2 = positionAttribute.getX(idx2);
+            const y2 = positionAttribute.getY(idx2);
+            area2D += (x1 * y2) - (x2 * y1);
+        }
+        area2D = Math.abs(area2D) * 0.5;
+        loopInfos.push({ loop, area2D });
+    }
+
+    // 6. The loop with the largest 2D area is the outer terrain perimeter
+    let maxArea = -1;
+    let outerIndex = -1;
+    for (let i = 0; i < loopInfos.length; i++) {
+        if (loopInfos[i].area2D > maxArea) {
+            maxArea = loopInfos[i].area2D;
+            outerIndex = i;
+        }
+    }
+
+    // 7. Collect segment index pairs only for loops that correspond to genuine building cutouts
+    const segmentIndices = [];
+    const maxAllowedDistToBuilding = 1.0; // meters (building footprint offset is 0.05m)
+
+    for (let i = 0; i < loopInfos.length; i++) {
+        if (i === outerIndex) {
+            continue;
+        }
+        const loop = loopInfos[i].loop;
+        const n = loop.length;
+
+        // If building bounding boxes are provided, verify that this loop is a genuine building cutout
+        // rather than an uncut terrain TIN boundary seam / T-junction phantom loop.
+        // In a true building cutout, EVERY single vertex of the loop lies within ~0.05m (<= 1.0m)
+        // of a building footprint. If any vertex extends into open ground (> 1.0m), the loop is a
+        // T-junction triangulation seam on the bordering uncut terrain triangle.
+        if (buildingBoxes && buildingBoxes.length > 0) {
+            let isPhantom = false;
+            for (let j = 0; j < n; j++) {
+                const x = positionAttribute.getX(loop[j]);
+                const y = positionAttribute.getY(loop[j]);
+
+                let minDist = Infinity;
+                for (let k = 0; k < buildingBoxes.length; k++) {
+                    const b = buildingBoxes[k];
+                    const dx = x < b.minX ? b.minX - x : x > b.maxX ? x - b.maxX : 0;
+                    const dy = y < b.minY ? b.minY - y : y > b.maxY ? y - b.maxY : 0;
+                    const dist = Math.hypot(dx, dy);
+                    if (dist < minDist) {
+                        minDist = dist;
+                        if (minDist <= maxAllowedDistToBuilding) {
+                            break;
+                        }
+                    }
+                }
+
+                if (minDist > maxAllowedDistToBuilding) {
+                    isPhantom = true;
+                    break;
+                }
+            }
+
+            if (isPhantom) {
+                continue;
+            }
+        }
+
+        for (let j = 0; j < n; j++) {
+            segmentIndices.push(loop[j], loop[(j + 1) % n]);
+        }
+    }
+
+    return segmentIndices.length > 0 ? segmentIndices : null;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Status terminal: a generic, read-only task log docked to the bottom edge of the viewer
 // container. Any code anywhere in the application reports the current or completed task through
@@ -514,7 +699,7 @@ export class GltfViewer {
         this.cullRebuildTimer = null;
         this.originalIndices = new Map();     // mesh -> TypedArray copy of the full index buffer
         this.meshObjectIds = new Map();       // mesh -> object ids in index-buffer order (batched)
-        this.edgeOverlays = new Map();        // mesh -> LineSegments edge overlay
+        this.edgeOverlays = [];               // [{ mesh, edges }] line segment edge overlays
 
         // Default right-click context menu; consuming applications may extend this array before
         // the first open. Item shape: { label, action(), isEnabled() } — isEnabled is evaluated
@@ -1060,15 +1245,15 @@ export class GltfViewer {
         this.buildEdgeOverlays(pickables);
     }
 
-    // Edge overlays for visual quality, skipped for extreme triangle counts and terrain surfaces.
+    // Edge overlays for visual quality, skipped for extreme triangle counts and terrain ground surfaces.
     // Existing overlays are disposed first so the edges always match the current index buffers.
     buildEdgeOverlays(meshes) {
-        for (const [mesh, edges] of this.edgeOverlays) {
+        for (const { mesh, edges } of this.edgeOverlays) {
             mesh.remove(edges);
             edges.geometry.dispose();
             edges.material.dispose();
         }
-        this.edgeOverlays.clear();
+        this.edgeOverlays = [];
 
         let totalTriangles = 0;
         for (const mesh of meshes) {
@@ -1100,6 +1285,57 @@ export class GltfViewer {
             return;
         }
 
+        const addOverlay = (mesh, edges) => {
+            edges.raycast = () => { };
+            mesh.add(edges);
+            this.edgeOverlays.push({ mesh, edges });
+        };
+
+        const createTerrainHoleOverlay = (mesh, holeIndices) => {
+            const holeGeometry = new THREE.BufferGeometry();
+            holeGeometry.setAttribute('position', mesh.geometry.getAttribute('position'));
+            holeGeometry.setIndex(new THREE.BufferAttribute(new Uint32Array(holeIndices), 1));
+            const holeEdges = new THREE.LineSegments(
+                holeGeometry,
+                new THREE.LineBasicMaterial({ color: 0x11141b, transparent: true, opacity: 0.55 })
+            );
+            addOverlay(mesh, holeEdges);
+        };
+
+        // Collect 2D horizontal plan view (X, Y) bounding boxes of visible buildings in geometry buffer coordinates
+        // to discriminate genuine building cutout holes from uncut terrain triangle T-junction seams.
+        const buildingBoxes = [];
+        for (let id = 0; id < this.objects.length; id++) {
+            const obj = this.objects[id];
+            if (obj.isTerrain || this.hiddenIds.has(id)) {
+                continue;
+            }
+            const pos = obj.mesh?.geometry?.getAttribute('position');
+            if (!pos) {
+                continue;
+            }
+
+            let minX = Infinity;
+            let maxX = -Infinity;
+            let minY = Infinity;
+            let maxY = -Infinity;
+
+            const start = this.batched ? obj.vertexStart : 0;
+            const end = this.batched ? start + obj.vertexCount : pos.count;
+            for (let i = start; i < end; i++) {
+                const x = pos.getX(i);
+                const y = pos.getY(i);
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+
+            if (minX <= maxX) {
+                buildingBoxes.push({ minX, maxX, minY, maxY });
+            }
+        }
+
         for (const mesh of meshes) {
             if (!mesh?.geometry) {
                 continue;
@@ -1120,43 +1356,75 @@ export class GltfViewer {
                                 count += this.objects[id].indexCount;
                             }
                         }
-                        if (count === 0) {
-                            continue;
+
+                        if (count > 0) {
+                            const filtered = new original.constructor(count);
+                            let offset = 0;
+                            for (const id of ids) {
+                                if (this.hiddenIds.has(id) || this.objects[id]?.isTerrain) {
+                                    continue;
+                                }
+                                const object = this.objects[id];
+                                filtered.set(original.subarray(object.indexStart, object.indexStart + object.indexCount), offset);
+                                offset += object.indexCount;
+                            }
+
+                            tempGeometry = new THREE.BufferGeometry();
+                            tempGeometry.setAttribute('position', mesh.geometry.getAttribute('position'));
+                            tempGeometry.setIndex(new THREE.BufferAttribute(filtered, 1));
+                            geometryForEdges = tempGeometry;
+                        } else {
+                            geometryForEdges = null;
                         }
 
-                        const filtered = new original.constructor(count);
-                        let offset = 0;
+                        // Generate internal hole boundary edges for visible terrain objects in the batch
                         for (const id of ids) {
-                            if (this.hiddenIds.has(id) || this.objects[id]?.isTerrain) {
+                            if (this.hiddenIds.has(id) || !this.objects[id]?.isTerrain) {
                                 continue;
                             }
                             const object = this.objects[id];
-                            filtered.set(original.subarray(object.indexStart, object.indexStart + object.indexCount), offset);
-                            offset += object.indexCount;
+                            const holeIndices = extractTerrainHoleIndices(
+                                mesh.geometry.getAttribute('position'),
+                                original,
+                                object.indexStart,
+                                object.indexCount,
+                                buildingBoxes
+                            );
+                            if (holeIndices) {
+                                createTerrainHoleOverlay(mesh, holeIndices);
+                            }
                         }
-
-                        tempGeometry = new THREE.BufferGeometry();
-                        tempGeometry.setAttribute('position', mesh.geometry.getAttribute('position'));
-                        tempGeometry.setIndex(new THREE.BufferAttribute(filtered, 1));
-                        geometryForEdges = tempGeometry;
                     }
                 }
             } else {
                 const id = this.meshObjects.get(mesh);
-                if (id !== undefined && this.objects[id]?.isTerrain) {
-                    continue;
-                }
-                if (mesh.name === 'Terrain') {
-                    continue;
+                const isTerrain = (id !== undefined && this.objects[id]?.isTerrain) || mesh.name === 'Terrain';
+                if (isTerrain) {
+                    if (id === undefined || !this.hiddenIds.has(id)) {
+                        const indexArray = mesh.geometry.index ? mesh.geometry.index.array : null;
+                        if (indexArray) {
+                            const holeIndices = extractTerrainHoleIndices(
+                                mesh.geometry.getAttribute('position'),
+                                indexArray,
+                                0,
+                                indexArray.length,
+                                buildingBoxes
+                            );
+                            if (holeIndices) {
+                                createTerrainHoleOverlay(mesh, holeIndices);
+                            }
+                        }
+                    }
+                    geometryForEdges = null;
                 }
             }
 
-            const edges = new THREE.LineSegments(
-                new THREE.EdgesGeometry(geometryForEdges, 25),
-                new THREE.LineBasicMaterial({ color: 0x11141b, transparent: true, opacity: 0.55 }));
-            edges.raycast = () => { };
-            mesh.add(edges);
-            this.edgeOverlays.set(mesh, edges);
+            if (geometryForEdges) {
+                const edges = new THREE.LineSegments(
+                    new THREE.EdgesGeometry(geometryForEdges, 25),
+                    new THREE.LineBasicMaterial({ color: 0x11141b, transparent: true, opacity: 0.55 }));
+                addOverlay(mesh, edges);
+            }
 
             if (tempGeometry) {
                 tempGeometry.dispose();
