@@ -925,53 +925,74 @@ export class GltfViewer {
             this.bvh = null;
         }
 
-        new GLTFLoader().parse(this.glbBuffer, '', (gltf) => {
-            this.root = gltf.scene;
-            // DiGi geometry is Z-up; rotate to the three.js Y-up convention.
-            this.root.rotation.x = -Math.PI / 2;
-            this.scene.add(this.root);
-            this.root.updateMatrixWorld(true);
+        try {
+            new GLTFLoader().parse(
+                this.glbBuffer,
+                '',
+                (gltf) => {
+                    this.root = gltf.scene;
+                    // DiGi geometry is Z-up; rotate to the three.js Y-up convention.
+                    this.root.rotation.x = -Math.PI / 2;
+                    this.scene.add(this.root);
+                    this.root.updateMatrixWorld(true);
 
-            // Streamed payloads are fully self-describing: the scene configuration (reference
-            // point, lights, camera) travels in the scene extras. Values provided by the host
-            // page take precedence over the embedded configuration.
-            const configuration = gltf.scene?.userData?.sceneConfiguration;
-            if (configuration) {
-                this.sceneData = { ...configuration, ...this.sceneData };
-                const fov = this.sceneData.Camera?.FieldOfView;
-                if (fov) {
-                    this.camera.fov = fov;
-                    this.camera.updateProjectionMatrix();
+                    // Streamed payloads are fully self-describing: the scene configuration (reference
+                    // point, lights, camera) travels in the scene extras. Values provided by the host
+                    // page take precedence over the embedded configuration.
+                    const configuration = gltf.scene?.userData?.sceneConfiguration;
+                    if (configuration) {
+                        this.sceneData = { ...configuration, ...this.sceneData };
+                        const fov = this.sceneData.Camera?.FieldOfView;
+                        if (fov) {
+                            this.camera.fov = fov;
+                            this.camera.updateProjectionMatrix();
+                        }
+                    }
+
+                    this.prepareMeshes(gltf);
+                    this.computeBounds();
+
+                    // The scope box was enabled before the payload arrived: the default box needs the
+                    // scene bounds, so the activation completes here.
+                    if (this.scopeBoxPending) {
+                        this.scopeBoxPending = false;
+                        this.setScopeBoxEnabled(true);
+                    }
+
+                    this.addGroundAndGrid();
+                    this.setupLights();
+                    this.applyFog();
+                    this.frameScene();
+
+                    this.container.dispatchEvent(new CustomEvent('gltf-ready', {
+                        detail: {
+                            objectCount: this.objects.filter((o) => !o.isTerrain).length,
+                            referencePoint: this.sceneData.ReferencePoint ?? null,
+                            name: this.sceneData.Name ?? null
+                        }
+                    }));
+
+                    // Deferred heavy work: edge overlays and raycast acceleration structures are built
+                    // after the first frame is presented so the UI never freezes on load.
+                    setTimeout(() => this.buildDeferredStructures(), 0);
+                },
+                (error) => {
+                    console.error('Error parsing glTF payload:', error);
+                    this.container.dispatchEvent(new CustomEvent('gltf-error', {
+                        detail: {
+                            error: error || new Error('Failed to parse 3D scene data.')
+                        }
+                    }));
                 }
-            }
-
-            this.prepareMeshes(gltf);
-            this.computeBounds();
-
-            // The scope box was enabled before the payload arrived: the default box needs the
-            // scene bounds, so the activation completes here.
-            if (this.scopeBoxPending) {
-                this.scopeBoxPending = false;
-                this.setScopeBoxEnabled(true);
-            }
-
-            this.addGroundAndGrid();
-            this.setupLights();
-            this.applyFog();
-            this.frameScene();
-
-            this.container.dispatchEvent(new CustomEvent('gltf-ready', {
+            );
+        } catch (error) {
+            console.error('Exception parsing glTF payload:', error);
+            this.container.dispatchEvent(new CustomEvent('gltf-error', {
                 detail: {
-                    objectCount: this.objects.filter((o) => !o.isTerrain).length,
-                    referencePoint: this.sceneData.ReferencePoint ?? null,
-                    name: this.sceneData.Name ?? null
+                    error: error || new Error('Failed to load 3D scene data.')
                 }
             }));
-
-            // Deferred heavy work: edge overlays and raycast acceleration structures are built
-            // after the first frame is presented so the UI never freezes on load.
-            setTimeout(() => this.buildDeferredStructures(), 0);
-        });
+        }
     }
 
     prepareMeshes(gltf) {
