@@ -27,6 +27,16 @@
 //   payloads toggle mesh visibility). The controls mount into a host-provided '#gltf-settings'
 //   element when the page has one (the host owns the surrounding card/title/theming); otherwise
 //   the engine creates its own collapsible panel docked to the left edge titled "Settings".
+// - Shade: the sun casts shadow-mapped shade from every object onto the ground plate and onto
+//   the surrounding objects ("Show shade" checkbox, checked by default; setShadowsVisible()).
+//   The shadow camera is an orthographic box fitted to the scene bounding sphere and anchored to
+//   the scene center, so the depth map does not depend on the view camera: it is rendered on
+//   change only (renderer.shadowMap.autoUpdate = false) and any mutation that alters caster
+//   depth - sun angle, view-range/terrain culling, scope box planes, legacy mesh visibility -
+//   must call requestShadowUpdate(). Navigation frames therefore pay nothing for the shade.
+//   Payload meshes without a NORMAL attribute get one computed at load (ensureNormals): the
+//   receiver shader normalises the vertex normal for its bias offset, and the all-zero default
+//   attribute turned every shadow lookup into NaN, so no shade was ever visible before.
 // - Status terminal: a read-only task log docked to the bottom edge of the container, attached
 //   by default for every view. One line (the most recent task) is visible; a snapping splitter
 //   above the text area reveals earlier entries one full line per step, and a vertical scrollbar
@@ -51,8 +61,8 @@
 // - Public API: frameScene(), frameSelection(), clearSelection(), getSunState(),
 //   setSun(azimuth, altitude), setSunIntensity(value), setAmbientIntensity(value),
 //   getUserData(reference), alignViewToDirection(direction), getEnvironmentState(),
-//   setGizmoVisible(visible), setGroundVisible(visible), setFog(value), setViewRange(meters),
-//   setScopeBoxEnabled(enabled), setScopeBoxVisible(visible), getScopeBoxState().
+//   setGizmoVisible(visible), setGroundVisible(visible), setShadowsVisible(visible), setFog(value),
+//   setViewRange(meters), setScopeBoxEnabled(enabled), setScopeBoxVisible(visible), getScopeBoxState().
 // - Right-click context menu: built-in default behavior with "Fit view", "Fit selection"
 //   (enabled only while objects are selected) and "Clear selection". Consuming applications may
 //   extend the `contextMenuItems` array ({ label, action(), isEnabled() }) before the first open.
@@ -95,6 +105,24 @@ const GROUND_COLOR = 0x44464c;
 const GROUND_OFFSET = 0.06;
 const GROUND_SHADOW_OFFSET = 0.04;
 const GROUND_GRID_OFFSET = 0.02;
+
+// Shade (shadow mapping). The sun is a directional light whose orthographic shadow camera is
+// fitted to the scene bounding sphere: a sphere of radius r projects to a disc of radius r from
+// any light direction, so a half-extent of r covers every caster and every receiver inside the
+// scene bounds; the margin only widens the strip of ground beyond the bounds that can still
+// receive shade at low sun altitudes. The light sits SHADOW_LIGHT_DISTANCE scene radii from the
+// center, and the depth range is clamped to the slab the sphere occupies along the light. The
+// map is square with SHADOW_MAP_SIZE texels per side (2048 -> ~1 m per texel for a 500 m query
+// radius whose terrain disc gives a ~900 m scene radius), filtered with the type below. Acne on
+// the flat facade and terrain triangles is removed by a normal bias expressed in texels, so it
+// follows the map resolution and the scene size: below ~2 texels the terrain stripes at low sun
+// altitudes, a depth bias of the same effect peter-pans the wall bases instead (issue #43 sweep).
+const SHADOW_MAP_SIZE = 2048;
+const SHADOW_MAP_TYPE = THREE.PCFSoftShadowMap;
+const SHADOW_EXTENT_FACTOR = 1.15;
+const SHADOW_LIGHT_DISTANCE = 4;
+const SHADOW_NORMAL_BIAS_TEXELS = 3;
+const SHADOW_OPACITY = 0.35;
 
 // Settings panel defaults. The view range hides objects whose center lies further from the
 // scene center than the given radius in meters; fog is a normalized 0..1 slider value.
@@ -211,6 +239,19 @@ function lightColorOf(light) {
 
 function objectIdAttributeOf(geometry) {
     return geometry.getAttribute('_objectid') ?? geometry.getAttribute('_OBJECTID') ?? null;
+}
+
+// The DiGi.GLTF payload carries no NORMAL attribute (GLTFLoader switches the material to
+// flatShading, so lighting comes from screen-space derivatives and never needs one). The shadow
+// receiver path does need it: the vertex shader offsets the shadow lookup along the vertex normal
+// (normalBias) and normalises it first, and normalising the all-zero default attribute yields NaN,
+// which fails the shadow frustum test on every fragment - the scene then receives no shade at all,
+// whatever the bias value. Computing normals once at load restores the lookup; lighting is unchanged
+// because flatShading still wins in the fragment shader.
+function ensureNormals(mesh) {
+    if (!mesh.geometry.getAttribute('normal')) {
+        mesh.geometry.computeVertexNormals();
+    }
 }
 
 // Extracts boundary edge line-segment indices for internal holes (e.g. building cutouts) in a terrain mesh.
@@ -676,7 +717,7 @@ export class GltfViewer {
         this.bvh = null;
 
         // Environment settings driven by the built-in Settings panel (and the public setters).
-        this.environmentState = { gizmoVisible: true, terrainVisible: true, groundVisible: true, terminalVisible: true, fog: FOG_DEFAULT, viewRange: VIEW_RANGE_DEFAULT, scopeBoxEnabled: false, scopeBoxVisible: true };
+        this.environmentState = { gizmoVisible: true, terrainVisible: true, groundVisible: true, terminalVisible: true, shadowsVisible: true, fog: FOG_DEFAULT, viewRange: VIEW_RANGE_DEFAULT, scopeBoxEnabled: false, scopeBoxVisible: true };
         this.groundGroup = null;
         this.hasTerrain = false;
 
@@ -747,8 +788,11 @@ export class GltfViewer {
         this.renderer.localClippingEnabled = true;
         this.renderer.setPixelRatio(window.devicePixelRatio);
         this.renderer.setSize(this.container.clientWidth, this.container.clientHeight);
-        this.renderer.shadowMap.enabled = true;
-        this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+        // The shadow map is rendered on demand (requestShadowUpdate) rather than every frame: the
+        // shadow camera never follows the view camera, so navigation leaves the depth map valid.
+        this.renderer.shadowMap.enabled = this.environmentState.shadowsVisible;
+        this.renderer.shadowMap.type = SHADOW_MAP_TYPE;
+        this.renderer.shadowMap.autoUpdate = false;
         this.container.appendChild(this.renderer.domElement);
 
         new ResizeObserver(() => this.onResize()).observe(this.container);
@@ -1013,6 +1057,7 @@ export class GltfViewer {
                 mesh.castShadow = true;
                 mesh.receiveShadow = true;
                 mesh.frustumCulled = true;
+                ensureNormals(mesh);
                 mesh.geometry.computeBoundingBox();
                 mesh.geometry.computeBoundingSphere();
 
@@ -1050,6 +1095,7 @@ export class GltfViewer {
             mesh.castShadow = true;
             mesh.receiveShadow = true;
             mesh.frustumCulled = true;
+            ensureNormals(mesh);
 
             let userData = mesh.userData && Object.keys(mesh.userData).length > 0 ? mesh.userData : null;
             if (!userData && mesh.parent && mesh.parent.userData && Object.keys(mesh.parent.userData).length > 0) {
@@ -1212,6 +1258,8 @@ export class GltfViewer {
             this.select([...this.selectedIds].filter((id) => !hidden.has(id)));
         }
 
+        // Culled objects must stop casting shade as well.
+        this.requestShadowUpdate();
         return true;
     }
 
@@ -1491,7 +1539,7 @@ export class GltfViewer {
 
         const shadowCatcher = new THREE.Mesh(
             new THREE.PlaneGeometry(size, size),
-            new THREE.ShadowMaterial({ opacity: 0.35 }));
+            new THREE.ShadowMaterial({ opacity: SHADOW_OPACITY }));
         shadowCatcher.rotation.x = -Math.PI / 2;
         shadowCatcher.position.set(this.center.x, elevation - GROUND_SHADOW_OFFSET, this.center.z);
         shadowCatcher.receiveShadow = true;
@@ -1531,14 +1579,19 @@ export class GltfViewer {
         this.scene.add(this.ambientLight);
 
         this.sunLight = new THREE.DirectionalLight(sunColor, this.sunState.intensity);
-        this.sunLight.castShadow = true;
-        const shadowExtent = this.radius * 2;
+        this.sunLight.castShadow = this.environmentState.shadowsVisible;
+        // Bounding-sphere fit (see SHADOW_EXTENT_FACTOR): the light orbits the scene center at a
+        // fixed distance, so the depth slab the sphere occupies along the light is fixed too.
+        const shadowExtent = this.radius * SHADOW_EXTENT_FACTOR;
+        const lightDistance = this.radius * SHADOW_LIGHT_DISTANCE;
         this.sunLight.shadow.camera.left = -shadowExtent;
         this.sunLight.shadow.camera.right = shadowExtent;
         this.sunLight.shadow.camera.top = shadowExtent;
         this.sunLight.shadow.camera.bottom = -shadowExtent;
-        this.sunLight.shadow.camera.far = this.radius * 10;
-        this.sunLight.shadow.mapSize.set(2048, 2048);
+        this.sunLight.shadow.camera.near = lightDistance - shadowExtent;
+        this.sunLight.shadow.camera.far = lightDistance + shadowExtent;
+        this.sunLight.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+        this.sunLight.shadow.normalBias = SHADOW_NORMAL_BIAS_TEXELS * (2 * shadowExtent / SHADOW_MAP_SIZE);
         this.sunLight.target.position.copy(this.center);
         this.scene.add(this.sunLight);
         this.scene.add(this.sunLight.target);
@@ -1565,7 +1618,7 @@ export class GltfViewer {
         const azimuthRad = THREE.MathUtils.degToRad(this.sunState.azimuth);
         const altitudeRad = THREE.MathUtils.degToRad(this.sunState.altitude);
 
-        const distance = this.radius * 4;
+        const distance = this.radius * SHADOW_LIGHT_DISTANCE;
         this.sunLight.position.set(
             this.center.x + distance * Math.cos(altitudeRad) * Math.sin(azimuthRad),
             this.center.y + distance * Math.sin(altitudeRad),
@@ -1573,6 +1626,28 @@ export class GltfViewer {
         this.sunLight.target.position.copy(this.center);
         this.sunLight.intensity = this.sunState.intensity;
         this.ambientLight.intensity = this.sunState.ambientIntensity;
+        this.requestShadowUpdate();
+    }
+
+    // Schedules one shadow depth pass for the next frame. The map is otherwise never re-rendered
+    // (renderer.shadowMap.autoUpdate = false), so every mutation that changes what casts shade
+    // - sun angle, culling, scope box planes, legacy mesh visibility - has to come through here.
+    requestShadowUpdate() {
+        if (this.renderer.shadowMap.enabled) {
+            this.renderer.shadowMap.needsUpdate = true;
+        }
+    }
+
+    // Shade on/off. Disabling both the renderer pass and the light's castShadow flag drops the
+    // shadow sampling from every receiving material through the lights-state hash (three.js
+    // re-links the programs itself), so the per-mesh castShadow/receiveShadow flags stay untouched.
+    setShadowsVisible(visible) {
+        this.environmentState.shadowsVisible = !!visible;
+        this.renderer.shadowMap.enabled = this.environmentState.shadowsVisible;
+        if (this.sunLight) {
+            this.sunLight.castShadow = this.environmentState.shadowsVisible;
+        }
+        this.requestShadowUpdate();
     }
 
     getSunState() {
@@ -2708,6 +2783,9 @@ export class GltfViewer {
             const faceCenter = center.clone().addScaledVector(outward, extents[axis]);
             this.scopeBoxPlanes[i].setFromNormalAndCoplanarPoint(outward.negate(), faceCenter);
         }
+
+        // Casters are clipped by the same planes (clipShadows), so the shade follows the box.
+        this.requestShadowUpdate();
     }
 
     forEachModelMaterial(callback) {
@@ -2740,6 +2818,7 @@ export class GltfViewer {
             // The clipping plane count is part of the shader program key.
             material.needsUpdate = true;
         });
+        this.requestShadowUpdate();
     }
 
     // Box containment with a small tolerance, in box-local coordinates.
@@ -2945,7 +3024,7 @@ export class GltfViewer {
     }
 
     // ------------------------------------------------------------------------------------------
-    // Settings panel with the environment controls (gizmo/ground visibility, fog, view range).
+    // Settings panel with the environment controls (gizmo/ground/shade visibility, fog, view range).
     // When the host page provides an element with id 'gltf-settings' (typically inside its own
     // left side panel card), the controls mount there and inherit the host theme. Without one,
     // the engine creates its own collapsible panel docked to the left edge of the viewport with
@@ -3040,6 +3119,7 @@ export class GltfViewer {
             this.environmentState.terminalVisible = checked;
             this.statusTerminal?.setVisible(checked);
         });
+        checkboxRow('Show shade', this.environmentState.shadowsVisible, (checked) => this.setShadowsVisible(checked));
 
         // Scope box rows: the visibility toggle only applies while the box is enabled, so it is
         // disabled and grayed whenever the primary checkbox is unchecked.
