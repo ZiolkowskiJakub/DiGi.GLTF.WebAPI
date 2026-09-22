@@ -34,12 +34,11 @@
 //   change only (renderer.shadowMap.autoUpdate = false) and any mutation that alters caster
 //   depth - sun angle, view-range/terrain culling, scope box planes, legacy mesh visibility -
 //   must call requestShadowUpdate(). Navigation frames therefore pay nothing for the shade.
-//   Payload meshes carry no NORMAL attribute and their triangle winding is inconsistent, so the
-//   engine builds "shadow normals" itself (prepareShadowNormals / updateShadowNormals): per-face
-//   normals flipped towards the current sun and averaged per vertex, refreshed on every sun
-//   change. The receiver shader normalises the vertex normal for its bias offset, and the
-//   all-zero default attribute turned every shadow lookup into NaN, so no shade was ever visible
-//   before; winding-derived normals instead pushed half of the terrain under itself.
+//   Payload meshes carry no NORMAL attribute, so the engine builds the shadow-bias normals itself
+//   (prepareShadowNormals): per-face normals derived from the winding, averaged per vertex and
+//   written once. The winding is consistent (DiGi.GLTF#1), so no per-sun re-orientation is needed;
+//   the receiver shader normalises the vertex normal for its bias offset and the all-zero default
+//   attribute would otherwise turn every shadow lookup into NaN.
 // - Status terminal: a read-only task log docked to the bottom edge of the container, attached
 //   by default for every view. One line (the most recent task) is visible; a snapping splitter
 //   above the text area reveals earlier entries one full line per step, and a vertical scrollbar
@@ -249,33 +248,44 @@ function objectIdAttributeOf(geometry) {
 // receiver path does need it: the vertex shader offsets the shadow lookup along the vertex normal
 // (normalBias) and normalises it first, and normalising the all-zero default attribute yields NaN,
 // which fails the shadow frustum test on every fragment - the scene then receives no shade at all,
-// whatever the bias value. Normals derived from the winding are no answer either: the payload's
-// triangles are wound inconsistently (both faces render, DoubleSide), so half of them would push
-// the lookup under the surface and the terrain shades itself in sun-independent patches. The
-// per-face normals are therefore computed once here without a sign, and updateShadowNormals
-// orients every face towards the current sun before averaging into the vertex attribute. Lighting
-// is unaffected because flatShading still wins in the fragment shader.
-// Returns { indices, faceNormals } for meshes that need the per-sun update, null otherwise.
+// whatever the bias value. The winding is consistent (DiGi.GLTF#1), so the face normals derived
+// from it are already oriented outward (buildings) or upward (terrain); they are averaged per
+// vertex once here and written to the attribute. Lighting is unaffected because flatShading still
+// wins in the fragment shader.
 function prepareShadowNormals(mesh) {
     const geometry = mesh.geometry;
     if (geometry.getAttribute('normal') || !geometry.index) {
-        return null;
+        return;
     }
 
     const position = geometry.getAttribute('position').array;
-    const indices = geometry.index.array.slice();
-    const faceNormals = new Float32Array(indices.length);
+    const indices = geometry.index.array;
+    const normal = new Float32Array(position.length);
     for (let i = 0; i < indices.length; i += 3) {
         const a = 3 * indices[i], b = 3 * indices[i + 1], c = 3 * indices[i + 2];
         const ux = position[b] - position[a], uy = position[b + 1] - position[a + 1], uz = position[b + 2] - position[a + 2];
         const vx = position[c] - position[a], vy = position[c + 1] - position[a + 1], vz = position[c + 2] - position[a + 2];
-        faceNormals[i] = uy * vz - uz * vy;
-        faceNormals[i + 1] = uz * vx - ux * vz;
-        faceNormals[i + 2] = ux * vy - uy * vx;
+        const nx = uy * vz - uz * vy;
+        const ny = uz * vx - ux * vz;
+        const nz = ux * vy - uy * vx;
+        for (let k = 0; k < 3; k++) {
+            const v = 3 * indices[i + k];
+            normal[v] += nx;
+            normal[v + 1] += ny;
+            normal[v + 2] += nz;
+        }
     }
 
-    geometry.setAttribute('normal', new THREE.BufferAttribute(new Float32Array(position.length), 3));
-    return { indices, faceNormals };
+    for (let v = 0; v < normal.length; v += 3) {
+        const length = Math.hypot(normal[v], normal[v + 1], normal[v + 2]);
+        if (length > 0) {
+            normal[v] /= length;
+            normal[v + 1] /= length;
+            normal[v + 2] /= length;
+        }
+    }
+
+    geometry.setAttribute('normal', new THREE.BufferAttribute(normal, 3));
 }
 
 // Extracts boundary edge line-segment indices for internal holes (e.g. building cutouts) in a terrain mesh.
@@ -763,7 +773,7 @@ export class GltfViewer {
         this.cullingReady = false;            // per-object centers/index ranges are computed
         this.cullRebuildTimer = null;
         this.originalIndices = new Map();     // mesh -> TypedArray copy of the full index buffer
-        this.shadowNormals = new Map();       // mesh -> { indices, faceNormals } (see prepareShadowNormals)
+
         this.meshObjectIds = new Map();       // mesh -> object ids in index-buffer order (batched)
         this.edgeOverlays = [];               // [{ mesh, edges }] line segment edge overlays
 
@@ -1651,53 +1661,13 @@ export class GltfViewer {
         this.sunLight.target.position.copy(this.center);
         this.sunLight.intensity = this.sunState.intensity;
         this.ambientLight.intensity = this.sunState.ambientIntensity;
-        this.updateShadowNormals();
         this.requestShadowUpdate();
     }
 
+    // The winding is consistent (DiGi.GLTF#1), so the shadow normals are computed once from it
+    // and never need re-orienting on a sun change.
     registerShadowNormals(mesh) {
-        const data = prepareShadowNormals(mesh);
-        if (data) {
-            this.shadowNormals.set(mesh, data);
-        }
-    }
-
-    // Rewrites the shadow-bias normals of every payload mesh for the current sun: each face
-    // normal is flipped to face the light, accumulated on its three vertices and normalised, so
-    // the receiver offset always leaves the lit side of the surface whatever the winding. Runs on
-    // every sun change (a few milliseconds for a regional scene) and uploads the attribute.
-    updateShadowNormals() {
-        if (!this.sunLight || this.shadowNormals.size === 0) {
-            return;
-        }
-
-        const toSunWorld = this.sunLight.position.clone().sub(this.sunLight.target.position).normalize();
-        const inverse = new THREE.Matrix4();
-        for (const [mesh, { indices, faceNormals }] of this.shadowNormals) {
-            const toSun = toSunWorld.clone().transformDirection(inverse.copy(mesh.matrixWorld).invert());
-            const normal = mesh.geometry.getAttribute('normal');
-            const array = normal.array;
-            array.fill(0);
-            for (let i = 0; i < indices.length; i += 3) {
-                let nx = faceNormals[i], ny = faceNormals[i + 1], nz = faceNormals[i + 2];
-                if (nx * toSun.x + ny * toSun.y + nz * toSun.z < 0) {
-                    nx = -nx; ny = -ny; nz = -nz;
-                }
-                for (let k = 0; k < 3; k++) {
-                    const v = 3 * indices[i + k];
-                    array[v] += nx; array[v + 1] += ny; array[v + 2] += nz;
-                }
-            }
-            for (let v = 0; v < array.length; v += 3) {
-                const length = Math.hypot(array[v], array[v + 1], array[v + 2]);
-                if (length > 0) {
-                    array[v] /= length; array[v + 1] /= length; array[v + 2] /= length;
-                } else {
-                    array[v + 1] = 1;
-                }
-            }
-            normal.needsUpdate = true;
-        }
+        prepareShadowNormals(mesh);
     }
 
     // Schedules one shadow depth pass for the next frame. The map is otherwise never re-rendered
