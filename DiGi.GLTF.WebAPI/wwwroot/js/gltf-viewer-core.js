@@ -1229,8 +1229,6 @@ export class GltfViewer {
     // object (its bounding-box middle) and, for batched payloads, the contiguous index-buffer
     // range of every object plus a copy of the full index buffer to rebuild filtered indices from.
     buildCullingData() {
-        const vertex = new THREE.Vector3();
-
         if (this.batched) {
             for (const mesh of this.batchMeshes) {
                 const index = mesh.geometry.index;
@@ -1271,22 +1269,11 @@ export class GltfViewer {
                 continue;
             }
 
-            if (this.batched) {
-                const position = mesh.geometry.getAttribute('position');
-                if (!position || object.vertexCount === 0) {
-                    continue;
-                }
-                mesh.updateWorldMatrix(true, false);
-                const box = new THREE.Box3();
-                const end = object.vertexStart + object.vertexCount;
-                for (let i = object.vertexStart; i < end; i++) {
-                    vertex.fromBufferAttribute(position, i).applyMatrix4(mesh.matrixWorld);
-                    box.expandByPoint(vertex);
-                }
-                object.center = box.getCenter(new THREE.Vector3());
-            } else {
-                object.center = new THREE.Box3().setFromObject(mesh).getCenter(new THREE.Vector3());
+            const box = this.expandByObjectBounds(new THREE.Box3(), object);
+            if (box.isEmpty()) {
+                continue;
             }
+            object.center = box.getCenter(new THREE.Vector3());
 
             // Terrain is trimmed per triangle rather than hidden as a whole (see applyCulling).
             if (object.isTerrain) {
@@ -1868,8 +1855,9 @@ export class GltfViewer {
     }
 
     // View range in meters (default 2000): objects whose center lies further from the scene
-    // center than the range are not rendered; terrain is trimmed per triangle. The index rebuild runs immediately; the expensive
-    // BVH/edge-overlay rebuild is debounced so slider drags stay responsive.
+    // center than the range are not rendered; terrain is trimmed per triangle. The index rebuild
+    // runs immediately; the expensive BVH/edge-overlay rebuild is debounced so slider drags stay
+    // responsive.
     setViewRange(range) {
         const value = Number(range);
         if (!isFinite(value) || value <= 0) {
@@ -1926,37 +1914,39 @@ export class GltfViewer {
         this.frameBounds(center, radius, direction.lengthSq() > 1e-6 ? direction.normalize() : undefined);
     }
 
-    // Union world-space bounding box over the selected objects, or null when empty. Batched
-    // objects share one merged mesh, so their geometry is the contiguous vertex sub-range
+    // Expands box by the world-space bounds of one object and returns it. Batched objects share one
+    // merged mesh, so their geometry is the contiguous vertex sub-range
     // [vertexStart, vertexStart + vertexCount) — Box3.setFromObject would measure the whole batch.
-    selectionBounds() {
-        const box = new THREE.Box3();
-        const vertex = new THREE.Vector3();
-
-        for (const id of this.selectedIds) {
-            const object = this.objects[id];
-            const mesh = object?.mesh;
-            if (!mesh) {
-                continue;
-            }
-
-            if (this.batched) {
-                const position = mesh.geometry?.getAttribute('position');
-                if (!position || object.vertexCount === 0) {
-                    continue;
-                }
-                mesh.updateWorldMatrix(true, false);
-                const end = object.vertexStart + object.vertexCount;
-                for (let i = object.vertexStart; i < end; i++) {
-                    vertex.fromBufferAttribute(position, i);
-                    vertex.applyMatrix4(mesh.matrixWorld);
-                    box.expandByPoint(vertex);
-                }
-            } else {
-                box.union(new THREE.Box3().setFromObject(mesh));
-            }
+    expandByObjectBounds(box, object) {
+        const mesh = object?.mesh;
+        if (!mesh) {
+            return box;
         }
 
+        if (this.batched) {
+            const position = mesh.geometry?.getAttribute('position');
+            if (!position || object.vertexCount === 0) {
+                return box;
+            }
+            mesh.updateWorldMatrix(true, false);
+            const vertex = new THREE.Vector3();
+            const end = Math.min(position.count, object.vertexStart + object.vertexCount);
+            for (let i = object.vertexStart; i < end; i++) {
+                box.expandByPoint(vertex.fromBufferAttribute(position, i).applyMatrix4(mesh.matrixWorld));
+            }
+        } else {
+            box.expandByObject(mesh);
+        }
+
+        return box;
+    }
+
+    // Union world-space bounding box over the selected objects, or null when empty.
+    selectionBounds() {
+        const box = new THREE.Box3();
+        for (const id of this.selectedIds) {
+            this.expandByObjectBounds(box, this.objects[id]);
+        }
         return box.isEmpty() ? null : box;
     }
 
@@ -2740,26 +2730,12 @@ export class GltfViewer {
     }
 
     // World-space bounds of every non-terrain object (the terrain would stretch the box far past
-    // the buildings), or null when the scene holds nothing but terrain. Batched objects are
-    // measured over their own vertex range of the shared batch mesh.
+    // the buildings), or null when the scene holds nothing but terrain.
     buildingBounds() {
         const box = new THREE.Box3();
-        const vertex = new THREE.Vector3();
         for (const object of this.objects) {
-            if (object.isTerrain || !object.mesh) {
-                continue;
-            }
-            if (this.batchMeshes.includes(object.mesh)) {
-                const position = object.mesh.geometry.getAttribute('position');
-                if (!position) {
-                    continue;
-                }
-                const end = Math.min(position.count, object.vertexStart + object.vertexCount);
-                for (let i = object.vertexStart; i < end; i++) {
-                    box.expandByPoint(vertex.fromBufferAttribute(position, i).applyMatrix4(object.mesh.matrixWorld));
-                }
-            } else {
-                box.union(new THREE.Box3().setFromObject(object.mesh));
+            if (!object.isTerrain) {
+                this.expandByObjectBounds(box, object);
             }
         }
         return box.isEmpty() ? null : box;
