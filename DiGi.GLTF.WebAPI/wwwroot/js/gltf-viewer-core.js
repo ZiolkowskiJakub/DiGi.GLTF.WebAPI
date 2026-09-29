@@ -1941,6 +1941,9 @@ export class GltfViewer {
 
         this.environmentState.viewRange = value;
         this.terrainClip.value.z = value;
+        for (const group of this.contextGroups.values()) {
+            this.applyContextRange(group);
+        }
         if (this.applyCulling()) {
             clearTimeout(this.cullRebuildTimer);
             this.cullRebuildTimer = setTimeout(() => this.rebuildAcceleration(), CULL_REBUILD_DELAY_MS);
@@ -3575,12 +3578,96 @@ export class GltfViewer {
         });
 
         group.userData.contextCategory = category;
+        group.updateMatrixWorld(true);
+        this.prepareContextRange(group);
         this.contextGroups.set(category, group);
+        this.applyContextRange(group);
         this.applyContextOpacity(category, opacity);
         group.visible = this.contextVisible(category);
         this.scene.add(group);
         group.updateMatrixWorld(true);
         return true;
+    }
+
+    // View range for a context group. A context object is shown only when it lies entirely within
+    // the range: a building is a group of objects sharing one reference (or a single object without
+    // one), and if any vertex of it is further from the scene center than the range (horizontal
+    // distance - DiGi XY maps to three.js XZ) the whole building is left out, never cut through.
+    // The per-building extents are measured once; every range change then only rebuilds the
+    // index buffers from the triangles of the buildings that fit.
+    prepareContextRange(group) {
+        const objectMap = group.userData?.objectMap ?? null;
+        const keyById = new Map();
+        if (objectMap) {
+            objectMap.forEach((entry, id) => keyById.set(id, entry.reference ? `r:${entry.reference}` : `o:${id}`));
+        }
+
+        const extents = new Map();
+        const meshes = [];
+        const vertex = new THREE.Vector3();
+        group.traverse((node) => {
+            const index = node.isMesh ? node.geometry.index : null;
+            const idAttribute = node.isMesh ? objectIdAttributeOf(node.geometry) : null;
+            if (!index) {
+                return;
+            }
+
+            const position = node.geometry.getAttribute('position');
+            const triangleKeys = new Array(index.count / 3);
+            for (let i = 0; i < index.count; i += 3) {
+                const id = idAttribute ? Math.round(idAttribute.getX(index.array[i])) : 0;
+                const key = keyById.get(id) ?? `m:${node.id}:${id}`;
+                triangleKeys[i / 3] = key;
+
+                let extent = extents.get(key) ?? 0;
+                for (let k = 0; k < 3; k++) {
+                    vertex.fromBufferAttribute(position, index.array[i + k]).applyMatrix4(node.matrixWorld);
+                    extent = Math.max(extent, Math.hypot(vertex.x - this.center.x, vertex.z - this.center.z));
+                }
+                extents.set(key, extent);
+            }
+            meshes.push({ mesh: node, original: index.array.slice(), triangleKeys });
+        });
+
+        group.userData.contextRange = { extents, meshes, shown: null };
+    }
+
+    applyContextRange(group) {
+        const state = group.userData?.contextRange;
+        if (!state) {
+            return;
+        }
+
+        const range = this.environmentState.viewRange;
+        const shown = new Set();
+        for (const [key, extent] of state.extents) {
+            if (extent <= range) {
+                shown.add(key);
+            }
+        }
+
+        if (state.shown && state.shown.size === shown.size && [...shown].every((key) => state.shown.has(key))) {
+            return;
+        }
+        state.shown = shown;
+
+        for (const { mesh, original, triangleKeys } of state.meshes) {
+            let count = 0;
+            for (const key of triangleKeys) {
+                if (shown.has(key)) {
+                    count += 3;
+                }
+            }
+            const filtered = new original.constructor(count);
+            let offset = 0;
+            for (let t = 0; t < triangleKeys.length; t++) {
+                if (shown.has(triangleKeys[t])) {
+                    filtered.set(original.subarray(t * 3, t * 3 + 3), offset);
+                    offset += 3;
+                }
+            }
+            mesh.geometry.setIndex(new THREE.BufferAttribute(filtered, 1));
+        }
     }
 
     contextState(category) {
