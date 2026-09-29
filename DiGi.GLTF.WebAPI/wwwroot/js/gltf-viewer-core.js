@@ -494,9 +494,37 @@ function terrainTriangleDistances(mesh, indexArray, indexStart, indexCount, cent
         a.fromBufferAttribute(position, indexArray[i]).applyMatrix4(mesh.matrixWorld);
         b.fromBufferAttribute(position, indexArray[i + 1]).applyMatrix4(mesh.matrixWorld);
         c.fromBufferAttribute(position, indexArray[i + 2]).applyMatrix4(mesh.matrixWorld);
-        distances[t] = Math.hypot((a.x + b.x + c.x) / 3 - center.x, (a.z + b.z + c.z) / 3 - center.z);
+        // Nearest corner, so every triangle the view range circle touches is kept; the terrain
+        // shader (see installTerrainClip) then cuts the exact circle out of those triangles.
+        distances[t] = Math.min(
+            Math.hypot(a.x - center.x, a.z - center.z),
+            Math.hypot(b.x - center.x, b.z - center.z),
+            Math.hypot(c.x - center.x, c.z - center.z));
     }
     return distances;
+}
+
+// Makes the terrain of a mesh follow the view range as an exact circle instead of a jagged
+// triangle edge: a per-vertex aTerrain flag marks terrain vertices and the patched material
+// discards terrain fragments further than clip.z from (clip.x, clip.y) in world XZ. clip is a
+// shared uniform holder ({ value: Vector3 }) so a range change needs no shader rebuild.
+function installTerrainClip(mesh, terrainVertexFlags, clip) {
+    const geometry = mesh.geometry;
+    geometry.setAttribute('aTerrain', new THREE.BufferAttribute(terrainVertexFlags, 1));
+    const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const material of materials) {
+        material.onBeforeCompile = (shader) => {
+            shader.uniforms.uTerrainClip = clip;
+            shader.vertexShader = shader.vertexShader
+                .replace('void main() {', 'attribute float aTerrain;\nvarying float vTerrain;\nvarying vec2 vTerrainXZ;\nvoid main() {')
+                .replace('#include <begin_vertex>', '#include <begin_vertex>\nvTerrain = aTerrain;\nvTerrainXZ = (modelMatrix * vec4(transformed, 1.0)).xz;');
+            shader.fragmentShader = shader.fragmentShader
+                .replace('void main() {', 'uniform vec3 uTerrainClip;\nvarying float vTerrain;\nvarying vec2 vTerrainXZ;\nvoid main() {')
+                .replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\nif (vTerrain > 0.5 && distance(vTerrainXZ, uTerrainClip.xy) > uTerrainClip.z) discard;');
+        };
+        material.customProgramCacheKey = () => 'terrainClip';
+        material.needsUpdate = true;
+    }
 }
 
 // Copies the triangles of an index range whose distance is within the range into target at
@@ -815,6 +843,7 @@ export class GltfViewer {
         // View range bounds: the host page may bind them to the scene through the
         // data-view-range-min|max|default attributes; otherwise the engine defaults apply.
         this.viewRangeBounds = this.readViewRangeBounds();
+        this.terrainClip = { value: new THREE.Vector3(0, 0, this.viewRangeBounds.default) };
 
         // Environment settings driven by the built-in Settings panel (and the public setters).
         this.environmentState = { gizmoVisible: true, terrainVisible: true, groundVisible: true, terminalVisible: true, shadowsVisible: true, fog: FOG_DEFAULT, viewRange: this.viewRangeBounds.default, scopeBoxEnabled: false, scopeBoxVisible: true };
@@ -1299,6 +1328,31 @@ export class GltfViewer {
                     object.visibleIndexCount = indexCount;
                 }
             }
+        }
+
+        this.terrainClip.value.set(this.center.x, this.center.z, this.environmentState.viewRange);
+        const terrainMeshes = new Map();
+        for (const object of this.objects) {
+            if (object.isTerrain && object.mesh) {
+                terrainMeshes.set(object.mesh, true);
+            }
+        }
+        for (const mesh of terrainMeshes.keys()) {
+            const vertexCount = mesh.geometry.getAttribute('position').count;
+            const flags = new Float32Array(vertexCount);
+            const original = this.originalIndices.get(mesh);
+            if (this.batched && original) {
+                for (const object of this.objects) {
+                    if (object.isTerrain && object.mesh === mesh) {
+                        for (let i = object.indexStart; i < object.indexStart + object.indexCount; i++) {
+                            flags[original[i]] = 1;
+                        }
+                    }
+                }
+            } else {
+                flags.fill(1);
+            }
+            installTerrainClip(mesh, flags, this.terrainClip);
         }
 
         this.cullingReady = true;
@@ -1883,6 +1937,7 @@ export class GltfViewer {
         }
 
         this.environmentState.viewRange = value;
+        this.terrainClip.value.z = value;
         if (this.applyCulling()) {
             clearTimeout(this.cullRebuildTimer);
             this.cullRebuildTimer = setTimeout(() => this.rebuildAcceleration(), CULL_REBUILD_DELAY_MS);
