@@ -21,7 +21,8 @@
 //   one smoothly aligns the camera to that direction around the current orbit target.
 // - Settings panel: built-in environment controls — "Show gizmo" and "Show ground" checkboxes
 //   (both checked by default), a "Fog" slider (default 0.2) driving an exponential distance fog,
-//   and a "View range" slider + numeric input (default 2000 m) that hides every object whose
+//   and a "View range" slider + numeric input (default 2000 m, or the scene-bound
+//   data-view-range-min|max|default attributes of the container) that hides every object whose
 //   center lies further from the scene center than the given radius (batched payloads are culled
 //   by rebuilding the merged index buffer from the per-object contiguous index ranges; legacy
 //   payloads toggle mesh visibility). The controls mount into a host-provided '#gltf-settings'
@@ -811,8 +812,12 @@ export class GltfViewer {
         this.lastHoverTime = 0;
         this.bvh = null;
 
+        // View range bounds: the host page may bind them to the scene through the
+        // data-view-range-min|max|default attributes; otherwise the engine defaults apply.
+        this.viewRangeBounds = this.readViewRangeBounds();
+
         // Environment settings driven by the built-in Settings panel (and the public setters).
-        this.environmentState = { gizmoVisible: true, terrainVisible: true, groundVisible: true, terminalVisible: true, shadowsVisible: true, fog: FOG_DEFAULT, viewRange: VIEW_RANGE_DEFAULT, scopeBoxEnabled: false, scopeBoxVisible: true };
+        this.environmentState = { gizmoVisible: true, terrainVisible: true, groundVisible: true, terminalVisible: true, shadowsVisible: true, fog: FOG_DEFAULT, viewRange: this.viewRangeBounds.default, scopeBoxEnabled: false, scopeBoxVisible: true };
         this.groundGroup = null;
         this.hasTerrain = false;
 
@@ -1854,7 +1859,20 @@ export class GltfViewer {
             : null;
     }
 
-    // View range in meters (default 2000): objects whose center lies further from the scene
+    // Reads the optional per-scene view range from data-view-range-min|max|default on the
+    // container. Valid only when all three are finite with 0 < min <= default <= max; anything
+    // else falls back to the engine constants (bound = false keeps the numeric input unclamped).
+    readViewRangeBounds() {
+        const min = parseFloat(this.container.dataset.viewRangeMin);
+        const max = parseFloat(this.container.dataset.viewRangeMax);
+        const value = parseFloat(this.container.dataset.viewRangeDefault);
+        if (isFinite(min) && isFinite(max) && isFinite(value) && min > 0 && min <= value && value <= max) {
+            return { min, max, default: value, bound: true };
+        }
+        return { min: VIEW_RANGE_MIN, max: VIEW_RANGE_MAX, default: VIEW_RANGE_DEFAULT, bound: false };
+    }
+
+    // View range in meters (default 2000 unless the host binds it to the scene): objects whose center lies further from the scene
     // center than the range are not rendered; terrain is trimmed per triangle. The index rebuild
     // runs immediately; the expensive BVH/edge-overlay rebuild is debounced so slider drags stay
     // responsive.
@@ -3332,9 +3350,10 @@ export class GltfViewer {
         const rangeWrapper = sliderLabel('View range');
         const rangeSlider = document.createElement('input');
         rangeSlider.type = 'range';
-        rangeSlider.min = String(VIEW_RANGE_MIN);
-        rangeSlider.max = String(VIEW_RANGE_MAX);
-        rangeSlider.step = '50';
+        const rangeBounds = this.viewRangeBounds;
+        rangeSlider.min = String(rangeBounds.min);
+        rangeSlider.max = String(rangeBounds.max);
+        rangeSlider.step = rangeBounds.bound ? String(Math.max(1, Math.round((rangeBounds.max - rangeBounds.min) / 100))) : '50';
         rangeSlider.value = String(this.environmentState.viewRange);
         rangeSlider.style.width = '100%';
         rangeWrapper.appendChild(rangeSlider);
@@ -3344,7 +3363,11 @@ export class GltfViewer {
         const rangeNumber = document.createElement('input');
         rangeNumber.type = 'number';
         rangeNumber.min = '1';
-        rangeNumber.step = '50';
+        rangeNumber.step = rangeSlider.step;
+        if (rangeBounds.bound) {
+            rangeNumber.min = String(rangeBounds.min);
+            rangeNumber.max = String(rangeBounds.max);
+        }
         rangeNumber.value = String(this.environmentState.viewRange);
         Object.assign(rangeNumber.style, { width: '80px', padding: '2px 6px', borderRadius: '4px' });
         if (floating) {
@@ -3366,15 +3389,19 @@ export class GltfViewer {
             this.setViewRange(parseFloat(rangeSlider.value));
         });
 
-        // The numeric input accepts values beyond the slider bounds; the slider just clamps its
-        // thumb to the closest position.
+        // Unbound scenes: the numeric input accepts values beyond the slider bounds and the slider
+        // just clamps its thumb. Scenes bound to their radius clamp the input to the range too.
         rangeNumber.addEventListener('change', () => {
-            const value = parseFloat(rangeNumber.value);
+            let value = parseFloat(rangeNumber.value);
             if (!isFinite(value) || value <= 0) {
                 rangeNumber.value = String(this.environmentState.viewRange);
                 return;
             }
-            rangeSlider.value = String(THREE.MathUtils.clamp(value, VIEW_RANGE_MIN, VIEW_RANGE_MAX));
+            if (rangeBounds.bound) {
+                value = THREE.MathUtils.clamp(value, rangeBounds.min, rangeBounds.max);
+                rangeNumber.value = String(value);
+            }
+            rangeSlider.value = String(THREE.MathUtils.clamp(value, rangeBounds.min, rangeBounds.max));
             this.setViewRange(value);
         });
     }
