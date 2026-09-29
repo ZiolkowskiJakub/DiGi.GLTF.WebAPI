@@ -846,7 +846,10 @@ export class GltfViewer {
         this.terrainClip = { value: new THREE.Vector3(0, 0, this.viewRangeBounds.default) };
 
         // Environment settings driven by the built-in Settings panel (and the public setters).
-        this.environmentState = { gizmoVisible: true, terrainVisible: true, groundVisible: true, terminalVisible: true, shadowsVisible: true, fog: FOG_DEFAULT, viewRange: this.viewRangeBounds.default, scopeBoxEnabled: false, scopeBoxVisible: true };
+        this.environmentState = { gizmoVisible: true, terrainVisible: true, groundVisible: true, terminalVisible: true, shadowsVisible: true, fog: FOG_DEFAULT, viewRange: this.viewRangeBounds.default, scopeBoxEnabled: false, scopeBoxVisible: true, surroundings: { visible: false, opacity: 0.5 } };
+        // Context objects (surrounding elements): extra payloads kept in their own group per category,
+        // outside this.objects and every picking structure, so they can never be selected.
+        this.contextGroups = new Map();
         this.groundGroup = null;
         this.hasTerrain = false;
 
@@ -3391,6 +3394,60 @@ export class GltfViewer {
             (checked) => this.setScopeBoxVisible(checked));
         syncScopeBoxVisibleRow();
 
+        // Surrounding elements: offered only when the host page provides the payload URL. The payload
+        // is fetched on the first check, never at start-up, so the main scene's load is unchanged.
+        const surroundingsUrl = this.container.dataset.surroundingsGlbUrl;
+        if (surroundingsUrl) {
+            let surroundingsLoading = false;
+            let surroundingsInput = null;
+            let opacityInput = null;
+            const syncSurroundingsOpacityRow = () => {
+                const enabled = this.contextVisible('surroundings');
+                opacityInput.disabled = !enabled;
+                opacityInput.parentElement.style.opacity = enabled ? '1' : '0.45';
+            };
+            surroundingsInput = checkboxRow('Show surrounding elements', this.contextVisible('surroundings'), async (checked) => {
+                if (!checked) {
+                    this.setContextVisible('surroundings', false);
+                    syncSurroundingsOpacityRow();
+                    return;
+                }
+                if (surroundingsLoading) {
+                    return;
+                }
+                surroundingsLoading = true;
+                surroundingsInput.disabled = true;
+                try {
+                    if (!this.contextGroups.has('surroundings')) {
+                        reportStatus('Loading surrounding elements...');
+                        await this.loadContextGlb(surroundingsUrl, 'surroundings');
+                        reportStatus('Surrounding elements loaded.');
+                    }
+                    this.setContextVisible('surroundings', true);
+                } catch (error) {
+                    reportStatus(`Surrounding elements could not be loaded: ${error?.message ?? error}`);
+                    this.setContextVisible('surroundings', false);
+                    surroundingsInput.checked = false;
+                } finally {
+                    surroundingsLoading = false;
+                    surroundingsInput.disabled = false;
+                    syncSurroundingsOpacityRow();
+                }
+            });
+
+            const opacityWrapper = sliderLabel('Transparency');
+            opacityInput = document.createElement('input');
+            opacityInput.type = 'range';
+            opacityInput.min = '0';
+            opacityInput.max = '1';
+            opacityInput.step = '0.05';
+            opacityInput.value = String(this.contextOpacity('surroundings'));
+            opacityInput.style.width = '100%';
+            opacityInput.addEventListener('input', () => this.setContextOpacity('surroundings', parseFloat(opacityInput.value)));
+            opacityWrapper.appendChild(opacityInput);
+            syncSurroundingsOpacityRow();
+        }
+
         const fogWrapper = sliderLabel('Fog');
         const fogInput = document.createElement('input');
         fogInput.type = 'range';
@@ -3458,6 +3515,121 @@ export class GltfViewer {
             }
             rangeSlider.value = String(THREE.MathUtils.clamp(value, rangeBounds.min, rangeBounds.max));
             this.setViewRange(value);
+        });
+    }
+
+    // ------------------------------------------------------------------------------------------
+    // Context objects (non-selectable surroundings). A context payload is a second .glb (same local
+    // origin as the scene, see the ReferencePoint alignment below) loaded lazily into its own group.
+    // It is deliberately kept out of this.objects, the raycast structures, the edge overlays and the
+    // object count, so it can never be hovered, picked, marquee-selected or listed. Each category
+    // ('surroundings' today) has its own visibility and opacity in environmentState, so a new object
+    // type only needs a new category name and a loadContextGlb call.
+    // ------------------------------------------------------------------------------------------
+    async loadContextGlb(url, category) {
+        if (!url || !category) {
+            return false;
+        }
+        const existing = this.contextGroups.get(category);
+        if (existing) {
+            return true;
+        }
+
+        const response = await fetch(url);
+        if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+        }
+        if (response.status === 204) {
+            throw new Error('nothing to show');
+        }
+        const buffer = await response.arrayBuffer();
+        if (!buffer || buffer.byteLength === 0) {
+            throw new Error('nothing to show');
+        }
+
+        const gltf = await new Promise((resolve, reject) => new GLTFLoader().parse(buffer, '', resolve, reject));
+        const group = gltf.scene;
+        // Same Z-up to Y-up rotation as the main scene root.
+        group.rotation.x = -Math.PI / 2;
+
+        // Both payloads are translated to a local origin; when the two reference points differ, shift
+        // the context group by the difference (Z-up vector, mapped to three.js Y-up by the rotation).
+        const main = this.sceneData.ReferencePoint;
+        const other = group.userData?.sceneConfiguration?.ReferencePoint;
+        if (main && other) {
+            group.position.set(other.X - main.X, other.Z - main.Z, -(other.Y - main.Y));
+        }
+
+        const opacity = this.contextOpacity(category);
+        group.traverse((node) => {
+            if (!node.isMesh) {
+                return;
+            }
+            // Cloned material: the payload's own material is never shared with the scene's objects.
+            node.material = node.material.clone();
+            node.castShadow = false;
+            node.receiveShadow = false;
+            node.frustumCulled = true;
+            node.renderOrder = 10;
+            node.raycast = () => { };
+        });
+
+        group.userData.contextCategory = category;
+        this.contextGroups.set(category, group);
+        this.applyContextOpacity(category, opacity);
+        group.visible = this.contextVisible(category);
+        this.scene.add(group);
+        group.updateMatrixWorld(true);
+        return true;
+    }
+
+    contextState(category) {
+        return this.environmentState[category] ?? null;
+    }
+
+    contextVisible(category) {
+        return !!this.contextState(category)?.visible;
+    }
+
+    contextOpacity(category) {
+        return this.contextState(category)?.opacity ?? 0.5;
+    }
+
+    setContextVisible(category, visible) {
+        const state = this.contextState(category);
+        if (!state) {
+            return;
+        }
+        state.visible = !!visible;
+        const group = this.contextGroups.get(category);
+        if (group) {
+            group.visible = state.visible;
+        }
+    }
+
+    setContextOpacity(category, value) {
+        const state = this.contextState(category);
+        if (!state) {
+            return;
+        }
+        state.opacity = THREE.MathUtils.clamp(Number(value) || 0, 0, 1);
+        this.applyContextOpacity(category, state.opacity);
+    }
+
+    applyContextOpacity(category, opacity) {
+        const group = this.contextGroups.get(category);
+        if (!group) {
+            return;
+        }
+        group.traverse((node) => {
+            if (!node.isMesh) {
+                return;
+            }
+            node.material.transparent = true;
+            node.material.opacity = opacity;
+            // A translucent surface must not write depth, or it would hide what stands behind it.
+            node.material.depthWrite = opacity >= 1;
+            node.material.needsUpdate = true;
         });
     }
 
