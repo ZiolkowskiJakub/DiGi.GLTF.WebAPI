@@ -65,7 +65,13 @@
 //   setSun(azimuth, altitude), setSunIntensity(value), setAmbientIntensity(value),
 //   getUserData(reference), alignViewToDirection(direction), getEnvironmentState(),
 //   setGizmoVisible(visible), setGroundVisible(visible), setShadowsVisible(visible), setFog(value),
-//   setViewRange(meters), setScopeBoxEnabled(enabled), setScopeBoxVisible(visible), getScopeBoxState().
+//   setViewRange(meters), setScopeBoxEnabled(enabled), setScopeBoxVisible(visible), getScopeBoxState(),
+//   setObjectAppearance(reference, { color, properties }), resetObjectAppearance(),
+//   setUnlitColors(enabled), getUnlitColors().
+// - Unlit colours: setUnlitColors(true) makes every model material present its base colour with
+//   no sun, ambient, shade or fog term (shade off, "Show shade" row locked) - an analysis result
+//   then reads exactly its legend colour from every side; edge overlays, ground and context groups
+//   keep their look. setUnlitColors(false) restores the lighting and the previous shade state.
 // - Right-click context menu: built-in default behavior with "Fit view", "Fit selection"
 //   (enabled only while objects are selected) and "Clear selection". Consuming applications may
 //   extend the `contextMenuItems` array ({ label, action(), isEnabled() }) before the first open.
@@ -513,7 +519,7 @@ function installTerrainClip(mesh, terrainVertexFlags, clip) {
     geometry.setAttribute('aTerrain', new THREE.BufferAttribute(terrainVertexFlags, 1));
     const materials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
     for (const material of materials) {
-        material.onBeforeCompile = (shader) => {
+        addShaderPatch(material, 'terrainClip', (shader) => {
             shader.uniforms.uTerrainClip = clip;
             shader.vertexShader = shader.vertexShader
                 .replace('void main() {', 'attribute float aTerrain;\nvarying float vTerrain;\nvarying vec2 vTerrainXZ;\nvoid main() {')
@@ -521,10 +527,52 @@ function installTerrainClip(mesh, terrainVertexFlags, clip) {
             shader.fragmentShader = shader.fragmentShader
                 .replace('void main() {', 'uniform vec3 uTerrainClip;\nvarying float vTerrain;\nvarying vec2 vTerrainXZ;\nvoid main() {')
                 .replace('#include <clipping_planes_fragment>', '#include <clipping_planes_fragment>\nif (vTerrain > 0.5 && distance(vTerrainXZ, uTerrainClip.xy) > uTerrainClip.z) discard;');
-        };
-        material.customProgramCacheKey = () => 'terrainClip';
-        material.needsUpdate = true;
+        });
     }
+}
+
+// Composable shader patches. Several engine features patch the same model material (the terrain
+// view-range clip, the unlit result colours) while three.js holds a single onBeforeCompile per
+// material, so each patch is registered under a key - registering a key again replaces it - and
+// all of them run in registration order. The program cache key joins the keys, so patched and
+// unpatched programs never share a cache entry.
+function addShaderPatch(material, key, patch) {
+    if (!material.userData.shaderPatches) {
+        material.userData.shaderPatches = new Map();
+    }
+    const patches = material.userData.shaderPatches;
+    patches.set(key, patch);
+    material.onBeforeCompile = (shader, renderer) => {
+        for (const apply of patches.values()) {
+            apply(shader, renderer);
+        }
+    };
+    const cacheKey = [...patches.keys()].join('|');
+    material.customProgramCacheKey = () => cacheKey;
+    material.needsUpdate = true;
+}
+
+// Unlit colours: while flag.value is 1 the patched material outputs its base colour with no sun,
+// ambient, shade or fog term, so a surface presents exactly its colour from every side and at any
+// distance. The colour is written after the output encoding and the fog: the batched vertex colours
+// carry the sRGB bytes of the producing application's colours, which are then the presented pixel
+// as they are; a legacy material's diffuse colour is linear (three.js colour management) and is
+// encoded like any other output. flag is a shared uniform holder ({ value: 0 | 1 }), so switching
+// needs no shader rebuild.
+function installUnlitColors(material, flag) {
+    addShaderPatch(material, 'unlitColors', (shader) => {
+        shader.uniforms.uUnlitColors = flag;
+        shader.fragmentShader = shader.fragmentShader
+            .replace('void main() {', 'uniform float uUnlitColors;\nvoid main() {')
+            .replace('#include <fog_fragment>', '#include <fog_fragment>\nif (uUnlitColors > 0.5) {\n#if defined( USE_COLOR_ALPHA ) || defined( USE_COLOR )\ngl_FragColor.rgb = vColor.rgb;\n#else\ngl_FragColor.rgb = linearToOutputTexel(vec4(diffuse, 1.0)).rgb;\n#endif\n}');
+    });
+}
+
+// '#rrggbb' to [r, g, b] bytes, without colour management: batched vertex colours store the bytes
+// of the producing application's colours as they are. Null for anything else.
+function hexBytes(color) {
+    const match = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(String(color ?? '').trim());
+    return match ? [parseInt(match[1], 16), parseInt(match[2], 16), parseInt(match[3], 16)] : null;
 }
 
 // Copies the triangles of an index range whose distance is within the range into target at
@@ -850,6 +898,14 @@ export class GltfViewer {
         // Context objects (surrounding elements): extra payloads kept in their own group per category,
         // outside this.objects and every picking structure, so they can never be selected.
         this.contextGroups = new Map();
+        // Object appearance overrides (setObjectAppearance): object id -> the colour and properties it
+        // had before its first change, so resetObjectAppearance restores them exactly.
+        this.appearanceSnapshots = new Map();
+        // Unlit colours (setUnlitColors): the shared uniform holder of the patched model materials, and
+        // the shade state to restore when the unlit colours are switched off again.
+        this.unlitColors = { value: 0 };
+        this.unlitColorsInstalled = false;
+        this.unlitShadowsVisible = null;
         this.groundGroup = null;
         this.hasTerrain = false;
 
@@ -1855,6 +1911,9 @@ export class GltfViewer {
         if (this.sunLight) {
             this.sunLight.castShadow = this.environmentState.shadowsVisible;
         }
+        if (this.shadowsInput) {
+            this.shadowsInput.checked = this.environmentState.shadowsVisible;
+        }
         this.requestShadowUpdate();
     }
 
@@ -2038,6 +2097,110 @@ export class GltfViewer {
     getUserData(reference) {
         const object = this.objects.find((o) => o.reference === reference);
         return object ? object.properties : null;
+    }
+
+    // Recolours the object with the given reference in place and, unless properties is undefined,
+    // replaces its opaque payload (what getUserData returns). color is a '#rrggbb' string, or null to
+    // keep the colour. The first change of an object snapshots its colour and payload for
+    // resetObjectAppearance(). Batched payloads write both the vertex colour range and the original
+    // colours the hover/selection tints revert to, so highlighting keeps working on top of the new
+    // colour; legacy payloads set the material colour. Returns false for an unknown reference.
+    setObjectAppearance(reference, { color = null, properties = undefined } = {}) {
+        const id = this.objects.findIndex((o) => o.reference === reference);
+        const object = id < 0 ? null : this.objects[id];
+        if (!object?.mesh || object.isTerrain) {
+            return false;
+        }
+
+        const bytes = color === null ? null : hexBytes(color);
+        const original = this.batched ? this.originalColors.get(object.mesh) : null;
+        const start = object.vertexStart * 4;
+        const end = start + object.vertexCount * 4;
+
+        if (!this.appearanceSnapshots.has(id)) {
+            this.appearanceSnapshots.set(id, {
+                colors: original ? original.slice(start, end) : null,
+                color: !this.batched && object.mesh.material?.color ? object.mesh.material.color.clone() : null,
+                properties: object.properties
+            });
+        }
+
+        if (bytes) {
+            if (original) {
+                for (let i = start; i < end; i += 4) {
+                    original[i] = bytes[0];
+                    original[i + 1] = bytes[1];
+                    original[i + 2] = bytes[2];
+                }
+            } else if (!this.batched && object.mesh.material?.color) {
+                object.mesh.material.color.set(color);
+            }
+            this.applyHighlight(id, id === this.hoveredId && !this.selectedIds.has(id) ? HOVER_TINT : null);
+        }
+
+        if (properties !== undefined) {
+            object.properties = properties;
+        }
+        return true;
+    }
+
+    // Restores the colour and payload of every object changed through setObjectAppearance.
+    resetObjectAppearance() {
+        for (const [id, snapshot] of this.appearanceSnapshots) {
+            const object = this.objects[id];
+            const original = this.batched ? this.originalColors.get(object.mesh) : null;
+            if (original && snapshot.colors) {
+                original.set(snapshot.colors, object.vertexStart * 4);
+            } else if (snapshot.color && object.mesh.material?.color) {
+                object.mesh.material.color.copy(snapshot.color);
+            }
+            object.properties = snapshot.properties;
+            this.applyHighlight(id, id === this.hoveredId && !this.selectedIds.has(id) ? HOVER_TINT : null);
+        }
+        this.appearanceSnapshots.clear();
+    }
+
+    // Unlit colours on/off. On: every model material presents its base colour with no lighting term
+    // (see installUnlitColors) and the shade is switched off, its row locked; edge overlays, the
+    // ground and context groups are unaffected. Off: the lit materials return and the shade state from
+    // before is restored. The materials are patched once, on the first switch; later switches flip a
+    // shared uniform only.
+    setUnlitColors(enabled) {
+        const value = enabled ? 1 : 0;
+        if (!this.root || this.unlitColors.value === value) {
+            return;
+        }
+
+        if (!this.unlitColorsInstalled) {
+            this.root.traverse((node) => {
+                if (!node.isMesh) {
+                    return;
+                }
+                for (const material of Array.isArray(node.material) ? node.material : [node.material]) {
+                    installUnlitColors(material, this.unlitColors);
+                }
+            });
+            this.unlitColorsInstalled = true;
+        }
+
+        this.unlitColors.value = value;
+        if (value === 1) {
+            this.unlitShadowsVisible = this.environmentState.shadowsVisible;
+            this.setShadowsVisible(false);
+        } else if (this.unlitShadowsVisible !== null) {
+            this.setShadowsVisible(this.unlitShadowsVisible);
+            this.unlitShadowsVisible = null;
+        }
+
+        if (this.shadowsInput) {
+            this.shadowsInput.disabled = value === 1;
+            this.shadowsInput.parentElement.style.opacity = value === 1 ? '0.45' : '1';
+            this.shadowsInput.parentElement.title = value === 1 ? 'Shade is off while unlit colours are shown' : '';
+        }
+    }
+
+    getUnlitColors() {
+        return this.unlitColors.value === 1;
     }
 
     initPicking() {
@@ -3378,7 +3541,8 @@ export class GltfViewer {
             this.environmentState.terminalVisible = checked;
             this.statusTerminal?.setVisible(checked);
         });
-        checkboxRow('Show shade', this.environmentState.shadowsVisible, (checked) => this.setShadowsVisible(checked));
+        // Kept so setShadowsVisible and setUnlitColors keep the row in step with the state.
+        this.shadowsInput = checkboxRow('Show shade', this.environmentState.shadowsVisible, (checked) => this.setShadowsVisible(checked));
 
         // Scope box rows: the visibility toggle only applies while the box is enabled, so it is
         // disabled and grayed whenever the primary checkbox is unchecked.
