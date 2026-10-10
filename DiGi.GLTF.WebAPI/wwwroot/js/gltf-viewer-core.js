@@ -49,7 +49,8 @@
 // - Scope box: a Revit-style manipulable clipping cuboid ("Scope Box" / "Scope Box visible"
 //   checkboxes in the Settings panel). When enabled, six GPU clipping planes restrict rendering
 //   to the box interior and geometry crossing the boundary is cut live (open cross-sections,
-//   like a plain clipped view). Dragging an edge moves
+//   like a plain clipped view); context objects (surroundings) are clipped by the same planes.
+//   Dragging an edge moves
 //   the box, clicking an edge reveals per-face push/pull arrows and a rotate handle (rotation
 //   is about the vertical axis, like Revit). Hiding the box (visible = false) keeps the
 //   clipping and the caps active. The default box is centered on the scene; the container
@@ -3223,15 +3224,16 @@ export class GltfViewer {
     }
 
     // Assigns (or clears) the shared clipping planes on every model material - batched meshes,
-    // legacy cloned materials and the edge overlay lines (mesh children) alike. Ground, grid,
-    // ViewCube and the scope box visuals live outside this.root and are never clipped.
+    // legacy cloned materials and the edge overlay lines (mesh children) alike - and on the
+    // context objects (surroundings), which sit outside this.root but are clipped like the
+    // buildings of the scene. Ground, grid, ViewCube and the scope box visuals are never clipped.
     applyScopeBoxClipping() {
         if (!this.root) {
             return;
         }
 
         const planes = this.environmentState.scopeBoxEnabled && this.scopeBoxState !== null ? this.scopeBoxPlanes : null;
-        this.forEachModelMaterial((material) => {
+        const apply = (material) => {
             if (material.clippingPlanes === planes) {
                 return;
             }
@@ -3239,7 +3241,15 @@ export class GltfViewer {
             material.clipShadows = planes !== null;
             // The clipping plane count is part of the shader program key.
             material.needsUpdate = true;
-        });
+        };
+        this.forEachModelMaterial(apply);
+        for (const group of this.contextGroups.values()) {
+            group.traverse((node) => {
+                if (node.isMesh) {
+                    apply(node.material);
+                }
+            });
+        }
         this.requestShadowUpdate();
     }
 
@@ -3747,6 +3757,8 @@ export class GltfViewer {
         this.contextGroups.set(category, group);
         this.applyContextRange(group);
         this.applyContextOpacity(category, opacity);
+        // The scope box may already be active; its planes clip the context objects as well.
+        this.applyScopeBoxClipping();
         group.visible = this.contextVisible(category);
         this.scene.add(group);
         group.updateMatrixWorld(true);
